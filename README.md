@@ -47,4 +47,3 @@ Start from [notes/文档索引.md](notes/文档索引.md). The main architecture
 - [notes/通信协议说明.md](notes/通信协议说明.md)
 - [notes/烧录与运行指令.md](notes/烧录与运行指令.md)
 - [notes/调试复盘.md](notes/调试复盘.md)
-
