@@ -1,5 +1,6 @@
 #include "imu_slave_node.h"
 
+#include <algorithm>
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <math.h>
@@ -121,6 +122,17 @@ bool ImuSlaveApp::loadClockModel(double &slope, double &intercept) {
   return valid;
 }
 
+// 读取 STREAM 启动瞬间冻结的采样时间模型，避免采集中低频 Beacon 造成时间戳跳变。
+bool ImuSlaveApp::loadSampleClockModel(double &slope, double &intercept) {
+  bool valid = false;
+  portENTER_CRITICAL(&offsetMux_);
+  valid = sampleClockModelValid_;
+  slope = sampleClockSlope_;
+  intercept = sampleClockIntercept_;
+  portEXIT_CRITICAL(&offsetMux_);
+  return valid;
+}
+
 // 线程安全读取最近收到 Beacon 的 Master MAC，用于后续单播发送。
 bool ImuSlaveApp::loadMasterMac(uint8_t outMac[6]) {
   bool valid = false;
@@ -146,7 +158,7 @@ void ImuSlaveApp::handleBeacon(const uint8_t *mac, const uint8_t *data, int len)
 
   const uint32_t localNowUs = micros();
   portENTER_CRITICAL(&offsetMux_);
-  if (state_ == capture::STATE_SYNC || state_ == capture::STATE_STREAM_PENDING) {
+  if (state_ == capture::STATE_SYNC || state_ == capture::STATE_STREAM_PENDING || state_ == capture::STATE_STREAM) {
     recordBeaconLocked(localNowUs, packet.masterTimeUs, packet.beaconSeq);
   }
   if (mac != nullptr) {
@@ -186,10 +198,13 @@ void ImuSlaveApp::resetRingLocked() {
 void ImuSlaveApp::resetSyncFitLocked() {
   clockSlope_ = 1.0;
   clockIntercept_ = 0.0;
+  sampleClockSlope_ = 1.0;
+  sampleClockIntercept_ = 0.0;
   syncOffsetUs_ = 0;
   syncDriftPpm_ = 0;
   syncResidualUs_ = 0;
   clockModelValid_ = false;
+  sampleClockModelValid_ = false;
   syncPointCount_ = 0;
   syncPointHead_ = 0;
   lastBeaconSeq_ = 0;
@@ -218,6 +233,7 @@ void ImuSlaveApp::applyState(uint8_t newState, uint16_t commandSeq, uint32_t eff
   }
   if (newState == capture::STATE_IDLE) {
     streamStarted_ = false;
+    sampleClockModelValid_ = false;
   }
   portEXIT_CRITICAL(&offsetMux_);
 
@@ -249,13 +265,12 @@ void ImuSlaveApp::recordBeaconLocked(uint32_t localRecvUs, uint32_t masterTimeUs
     ++syncPointCount_;
   }
   lastBeaconSeq_ = beaconSeq;
-  updateClockFitLocked();
 }
 
-void ImuSlaveApp::updateClockFitLocked() {
+// 对当前同步窗口做普通最小二乘拟合；includeMask 非空时只使用 mask 选中的点。
+bool ImuSlaveApp::fitClockModelLocked(const bool *includeMask, double &slope, double &intercept, double &residualRms) {
   if (syncPointCount_ < 2) {
-    clockModelValid_ = false;
-    return;
+    return false;
   }
 
   const uint8_t oldestIndex = static_cast<uint8_t>((syncPointHead_ + SYNC_WINDOW_CAPACITY - syncPointCount_) % SYNC_WINDOW_CAPACITY);
@@ -264,8 +279,12 @@ void ImuSlaveApp::updateClockFitLocked() {
   double sumY = 0.0;
   double sumXX = 0.0;
   double sumXY = 0.0;
+  uint8_t usedCount = 0;
 
   for (uint8_t i = 0; i < syncPointCount_; ++i) {
+    if (includeMask != nullptr && !includeMask[i]) {
+      continue;
+    }
     const uint8_t index = static_cast<uint8_t>((oldestIndex + i) % SYNC_WINDOW_CAPACITY);
     const double x = static_cast<double>(static_cast<uint32_t>(syncPoints_[index].localUs - base.localUs));
     const double y = static_cast<double>(static_cast<int32_t>(syncPoints_[index].masterUs - base.masterUs));
@@ -273,34 +292,120 @@ void ImuSlaveApp::updateClockFitLocked() {
     sumY += y;
     sumXX += x * x;
     sumXY += x * y;
+    ++usedCount;
   }
 
-  const double n = static_cast<double>(syncPointCount_);
+  if (usedCount < 2) {
+    return false;
+  }
+
+  const double n = static_cast<double>(usedCount);
   const double denom = n * sumXX - sumX * sumX;
   if (denom == 0.0) {
+    return false;
+  }
+
+  slope = (n * sumXY - sumX * sumY) / denom;
+  const double interceptRel = (sumY - slope * sumX) / n;
+  intercept = static_cast<double>(base.masterUs) + interceptRel - slope * static_cast<double>(base.localUs);
+
+  double residualSq = 0.0;
+  uint8_t residualCount = 0;
+  for (uint8_t i = 0; i < syncPointCount_; ++i) {
+    if (includeMask != nullptr && !includeMask[i]) {
+      continue;
+    }
+    const uint8_t index = static_cast<uint8_t>((oldestIndex + i) % SYNC_WINDOW_CAPACITY);
+    const double predicted = slope * static_cast<double>(syncPoints_[index].localUs) + intercept;
+    const double error = predicted - static_cast<double>(syncPoints_[index].masterUs);
+    residualSq += error * error;
+    ++residualCount;
+  }
+
+  if (residualCount == 0) {
+    return false;
+  }
+  residualRms = sqrt(residualSq / static_cast<double>(residualCount));
+  return true;
+}
+
+// 用两遍拟合更新 Slave 的线性时钟模型，第二遍会剔除单向 ESP-NOW 接收抖动中的离群点。
+void ImuSlaveApp::updateClockFitLocked() {
+  double slope = 1.0;
+  double intercept = 0.0;
+  double residualRms = 0.0;
+  if (!fitClockModelLocked(nullptr, slope, intercept, residualRms)) {
     clockModelValid_ = false;
     return;
   }
 
-  const double slope = (n * sumXY - sumX * sumY) / denom;
-  const double interceptRel = (sumY - slope * sumX) / n;
-  clockSlope_ = slope;
-  clockIntercept_ = static_cast<double>(base.masterUs) + interceptRel - slope * static_cast<double>(base.localUs);
+  if (syncPointCount_ >= SYNC_MIN_ROBUST_POINTS) {
+    const uint8_t oldestIndex = static_cast<uint8_t>((syncPointHead_ + SYNC_WINDOW_CAPACITY - syncPointCount_) % SYNC_WINDOW_CAPACITY);
+    double residualAbs[SYNC_WINDOW_CAPACITY] = {};
+    bool includeMask[SYNC_WINDOW_CAPACITY] = {};
+    uint8_t residualCount = 0;
 
-  double residualSq = 0.0;
-  for (uint8_t i = 0; i < syncPointCount_; ++i) {
-    const uint8_t index = static_cast<uint8_t>((oldestIndex + i) % SYNC_WINDOW_CAPACITY);
-    const double predicted = slope * static_cast<double>(syncPoints_[index].localUs) + clockIntercept_;
-    const double error = predicted - static_cast<double>(syncPoints_[index].masterUs);
-    residualSq += error * error;
+    for (uint8_t i = 0; i < syncPointCount_; ++i) {
+      const uint8_t index = static_cast<uint8_t>((oldestIndex + i) % SYNC_WINDOW_CAPACITY);
+      const double predicted = slope * static_cast<double>(syncPoints_[index].localUs) + intercept;
+      residualAbs[residualCount++] = fabs(predicted - static_cast<double>(syncPoints_[index].masterUs));
+    }
+
+    double sortedResiduals[SYNC_WINDOW_CAPACITY] = {};
+    memcpy(sortedResiduals, residualAbs, residualCount * sizeof(double));
+    std::sort(sortedResiduals, sortedResiduals + residualCount);
+
+    size_t keepCount = residualCount * (100U - SYNC_OUTLIER_REJECT_PERCENT) / 100U;
+    if (keepCount < SYNC_MIN_ROBUST_POINTS) {
+      keepCount = SYNC_MIN_ROBUST_POINTS;
+    }
+    if (keepCount > residualCount) {
+      keepCount = residualCount;
+    }
+
+    const double percentileLimit = sortedResiduals[keepCount - 1U];
+    const double rejectLimit = std::min(percentileLimit, SYNC_OUTLIER_ABS_US);
+    uint8_t includedCount = 0;
+    for (uint8_t i = 0; i < syncPointCount_; ++i) {
+      includeMask[i] = residualAbs[i] <= rejectLimit;
+      if (includeMask[i]) {
+        ++includedCount;
+      }
+    }
+
+    if (includedCount >= SYNC_MIN_ROBUST_POINTS) {
+      double robustSlope = 1.0;
+      double robustIntercept = 0.0;
+      double robustResidualRms = 0.0;
+      if (fitClockModelLocked(includeMask, robustSlope, robustIntercept, robustResidualRms)) {
+        slope = robustSlope;
+        intercept = robustIntercept;
+        residualRms = robustResidualRms;
+      }
+    }
   }
 
   const uint32_t nowUs = micros();
+  clockSlope_ = slope;
+  clockIntercept_ = intercept;
   const double nowMaster = clockSlope_ * static_cast<double>(nowUs) + clockIntercept_;
   syncOffsetUs_ = static_cast<int32_t>(nowMaster - static_cast<double>(nowUs));
   syncDriftPpm_ = static_cast<int32_t>((clockSlope_ - 1.0) * 1000000.0);
-  syncResidualUs_ = static_cast<int32_t>(sqrt(residualSq / n));
+  syncResidualUs_ = static_cast<int32_t>(residualRms);
   clockModelValid_ = true;
+}
+
+// 在统一 STREAM 起点冻结一份采样时间模型；后续调度模型可继续随 Beacon 微调。
+void ImuSlaveApp::freezeSampleClockLocked() {
+  if (clockModelValid_) {
+    sampleClockSlope_ = clockSlope_;
+    sampleClockIntercept_ = clockIntercept_;
+    sampleClockModelValid_ = true;
+  } else {
+    sampleClockSlope_ = 1.0;
+    sampleClockIntercept_ = 0.0;
+    sampleClockModelValid_ = false;
+  }
 }
 
 uint32_t ImuSlaveApp::localToMasterTimeUs(uint32_t localUs) {
@@ -308,6 +413,15 @@ uint32_t ImuSlaveApp::localToMasterTimeUs(uint32_t localUs) {
   double intercept = 0.0;
   if (!loadClockModel(slope, intercept)) {
     return localUs;
+  }
+  return static_cast<uint32_t>(slope * static_cast<double>(localUs) + intercept);
+}
+
+uint32_t ImuSlaveApp::localToSampleTimeUs(uint32_t localUs) {
+  double slope = 1.0;
+  double intercept = 0.0;
+  if (!loadSampleClockModel(slope, intercept)) {
+    return localToMasterTimeUs(localUs);
   }
   return static_cast<uint32_t>(slope * static_cast<double>(localUs) + intercept);
 }
@@ -320,6 +434,7 @@ void ImuSlaveApp::sendSyncDiag() {
 
   capture::SyncDiagPacket diag{};
   portENTER_CRITICAL(&offsetMux_);
+  updateClockFitLocked();
   diag.source = config_.nodeSource;
   diag.state = state_;
   diag.beaconSeq = lastBeaconSeq_;
@@ -500,16 +615,24 @@ void ImuSlaveApp::wirelessTask() {
     }
 
     const uint8_t state = currentState();
-    if ((state == capture::STATE_SYNC || state == capture::STATE_STREAM_PENDING) &&
-        static_cast<uint32_t>(millis() - lastSyncDiagMs_) >= SYNC_DIAG_INTERVAL_MS) {
-      sendSyncDiag();
+    if (static_cast<uint32_t>(millis() - lastSyncDiagMs_) >= SYNC_DIAG_INTERVAL_MS) {
+      if (state == capture::STATE_SYNC || state == capture::STATE_STREAM_PENDING) {
+        sendSyncDiag();
+      } else if (state == capture::STATE_STREAM) {
+        portENTER_CRITICAL(&offsetMux_);
+        updateClockFitLocked();
+        portEXIT_CRITICAL(&offsetMux_);
+      }
       lastSyncDiagMs_ = millis();
     }
 
     if (state == capture::STATE_STREAM_PENDING &&
         static_cast<int32_t>(localToMasterTimeUs(micros()) - pendingStreamStartUs_) >= 0) {
+      portENTER_CRITICAL(&offsetMux_);
       state_ = capture::STATE_STREAM;
       streamStarted_ = true;
+      freezeSampleClockLocked();
+      portEXIT_CRITICAL(&offsetMux_);
       sendStateAck(lastCommandSeq_, pendingStreamStartUs_);
     }
 
@@ -583,7 +706,7 @@ void ImuSlaveApp::sensorTask() {
     const uint32_t localTimeUs = micros();
 
     capture::ImuRawSample sample{};
-    sample.timestampUs = localToMasterTimeUs(localTimeUs);
+    sample.timestampUs = localToSampleTimeUs(localTimeUs);
 
     if (!readSensor(sample)) {
       noteDroppedSamples(static_cast<uint32_t>(batchCount) + 1U);

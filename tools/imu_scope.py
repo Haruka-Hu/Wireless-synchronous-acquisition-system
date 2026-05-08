@@ -106,8 +106,12 @@ MIN_FRAME_SIZE = 7
 TIMESTAMP_RELOCK_GAP_US = 250_000
 TIMESTAMP_RELOCK_BACKWARD_US = 2_000
 SYNC_STABLE_WINDOW_S = 3.0
-SYNC_STABLE_RESIDUAL_US = 3_000
-SYNC_STABLE_DRIFT_RANGE_PPM = 20
+SYNC_MIN_BEACON_COUNT = 30
+SYNC_USABLE_RESIDUAL_US = 3_000
+SYNC_STABLE_RESIDUAL_US = 1_000
+SYNC_EXCELLENT_RESIDUAL_US = 500
+SYNC_STABLE_DRIFT_RANGE_PPM = 100
+SYNC_EXCELLENT_DRIFT_RANGE_PPM = 50
 
 STATE_NAMES = {
     0: "IDLE",
@@ -815,6 +819,8 @@ class MainWindow(QMainWindow):
         self.rate_last_time = time.time()
         self.curves: dict[int, tuple] = {}
         self.emg_plots: list[pg.PlotItem] = []
+        self.control_status_text = ""
+        self.control_status_until = 0.0
 
         self.setWindowTitle("Wireless Capture Scope - EMG Bandpass Mode")
         self.resize(1440, 1000) # 调高一点窗口高度容纳更多图表
@@ -955,11 +961,64 @@ class MainWindow(QMainWindow):
         state = "在线" if is_online else "离线"
         return f"{name} {state} {self.source_rates[source_id]:.0f}/s"
 
+    def _latest_master_state_event(self, state_events: list[StateEvent]) -> StateEvent | None:
+        """返回最近一条 Master 自身的状态事件，用于判断 STREAM 是否已经真正开始。"""
+        for event in reversed(state_events):
+            if event.source_id == SOURCE_EMG:
+                return event
+        return None
+
+    def _format_emg_status(
+        self,
+        system_state: int,
+        emg_count: int,
+        emg_quality_text: str,
+        state_events: list[StateEvent],
+        now: float,
+    ) -> str:
+        """根据系统状态生成 EMG 状态栏，避免把非 STREAM 阶段的 0 点误判为故障。"""
+        if system_state == 0:
+            return "EMG 等待采集态 (IDLE 中不输出 EMG)"
+        if system_state == 1:
+            return "EMG 等待采集态 (SYNC 中不输出 EMG)"
+        if system_state == 2:
+            return "EMG 等待统一启动 (STREAM_PENDING)"
+
+        latest_master_event = self._latest_master_state_event(state_events)
+        stream_elapsed = now - latest_master_event.host_rx_time if latest_master_event is not None else 0.0
+        if emg_count == 0 and stream_elapsed >= 1.0:
+            return "EMG STREAM 已进入但无数据，请检查 ADS1298/DRDY/接线"
+        return f"EMG {emg_count} 点 {self.source_rates[SOURCE_EMG]:.0f}/s | {emg_quality_text}"
+
+    def _stream_sync_warning(self) -> str:
+        """在开始采集前给出同步质量提示；提示不阻止用户手动进入 STREAM。"""
+        _, sync_diag, _ = self.model.sync_snapshot()
+        warnings = []
+        for source_id, name in ((SOURCE_GYRO, "Gyro"), (SOURCE_ACCEL, "Accel")):
+            values = sync_diag.get(source_id, [])
+            if not values:
+                warnings.append(f"{name} 无同步诊断")
+                continue
+            latest = values[-1]
+            if latest.beacon_count < SYNC_MIN_BEACON_COUNT:
+                warnings.append(f"{name} Beacon 不足")
+            elif abs(latest.residual_us) > SYNC_USABLE_RESIDUAL_US:
+                warnings.append(f"{name} residual {latest.residual_us}us")
+        if not warnings:
+            return ""
+        return "同步质量不足: " + ", ".join(warnings)
+
     def send_control_command(self, command: str) -> None:
         """发送 START_SYNC/START_STREAM/STOP 到 Master。"""
         try:
+            warning_text = self._stream_sync_warning() if command == "START_STREAM" else ""
             self.reader.send_text_command(command)
-            self.primary_status_label.setText(f"已发送控制命令: {command}")
+            if warning_text:
+                self.control_status_text = f"已发送控制命令: {command}；{warning_text}"
+            else:
+                self.control_status_text = f"已发送控制命令: {command}"
+            self.control_status_until = time.time() + 3.0
+            self.primary_status_label.setText(self.control_status_text)
         except Exception as exc:
             QMessageBox.warning(self, "命令发送失败", str(exc))
 
@@ -969,15 +1028,28 @@ class MainWindow(QMainWindow):
             return f"{name} --"
         latest = values[-1]
         recent = [item for item in values if now - item.host_rx_time <= SYNC_STABLE_WINDOW_S]
-        stable = False
+        quality = "未同步"
+        if latest.beacon_count >= SYNC_MIN_BEACON_COUNT:
+            quality = "可用" if abs(latest.residual_us) <= SYNC_USABLE_RESIDUAL_US else "未稳"
         if len(recent) >= 5:
-            residual_ok = all(abs(item.residual_us) <= SYNC_STABLE_RESIDUAL_US for item in recent)
             drift_values = [item.drift_ppm for item in recent]
-            drift_ok = max(drift_values) - min(drift_values) <= SYNC_STABLE_DRIFT_RANGE_PPM
-            stable = residual_ok and drift_ok
-        state = "稳定" if stable else "未稳"
+            drift_range = max(drift_values) - min(drift_values)
+            stable = (
+                latest.beacon_count >= SYNC_MIN_BEACON_COUNT
+                and all(abs(item.residual_us) <= SYNC_STABLE_RESIDUAL_US for item in recent)
+                and drift_range <= SYNC_STABLE_DRIFT_RANGE_PPM
+            )
+            excellent = (
+                latest.beacon_count >= SYNC_MIN_BEACON_COUNT
+                and all(abs(item.residual_us) <= SYNC_EXCELLENT_RESIDUAL_US for item in recent)
+                and drift_range <= SYNC_EXCELLENT_DRIFT_RANGE_PPM
+            )
+            if excellent:
+                quality = "优秀"
+            elif stable:
+                quality = "稳定"
         return (
-            f"{name} {state} off {latest.offset_us}us drift {latest.drift_ppm}ppm "
+            f"{name} {quality} off {latest.offset_us}us drift {latest.drift_ppm}ppm "
             f"res {latest.residual_us}us n {latest.beacon_count}"
         )
 
@@ -1029,11 +1101,19 @@ class MainWindow(QMainWindow):
         slave2_last_rx = status_snapshot.get(SOURCE_ACCEL, (0, 0.0))[1]
         slave1_text = self._format_link_status("Slave-01 Gyro", SOURCE_GYRO, slave1_last_rx, now)
         slave2_text = self._format_link_status("Slave-02 Accel", SOURCE_ACCEL, slave2_last_rx, now)
+        emg_status = self._format_emg_status(
+            system_state,
+            emg_count,
+            getattr(self, "emg_quality_text", "CH6 -- | CH7 -- | CH8 --"),
+            state_events,
+            now,
+        )
+        control_status = f" | {self.control_status_text}" if now < self.control_status_until else ""
         self.primary_status_label.setText(
             f"串口 {self.port} @ {self.baud} | "
-            f"EMG {emg_count} 点 {self.source_rates[SOURCE_EMG]:.0f}/s | "
-            f"{getattr(self, 'emg_quality_text', 'CH6 -- | CH7 -- | CH8 --')} | "
+            f"{emg_status} | "
             f"{record_state}"
+            f"{control_status}"
         )
         self.link_status_label.setText(
             f"{slave1_text} | {slave2_text} | "

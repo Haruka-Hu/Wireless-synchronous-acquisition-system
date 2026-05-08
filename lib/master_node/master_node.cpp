@@ -385,10 +385,10 @@ uint8_t MasterApp::currentState() const {
 
 uint32_t MasterApp::beaconIntervalMs(uint8_t state) const {
   if (state == capture::STATE_SYNC || state == capture::STATE_STREAM_PENDING) {
-    return 100;
+    return 20;
   }
   if (state == capture::STATE_STREAM) {
-    return 1000;
+    return 200;
   }
   return 2000;
 }

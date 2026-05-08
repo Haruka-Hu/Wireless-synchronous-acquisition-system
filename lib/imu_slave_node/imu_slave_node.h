@@ -55,7 +55,10 @@ class ImuSlaveApp {
   static constexpr uint32_t SEND_SUPERFRAME_US = 20000;
   static constexpr uint8_t MAX_SENDS_PER_SLOT = 3;
   static constexpr uint32_t RETRANSMIT_INTERVAL_US = 40000;
-  static constexpr size_t SYNC_WINDOW_CAPACITY = 64;
+  static constexpr size_t SYNC_WINDOW_CAPACITY = 128;
+  static constexpr size_t SYNC_MIN_ROBUST_POINTS = 8;
+  static constexpr uint8_t SYNC_OUTLIER_REJECT_PERCENT = 20;
+  static constexpr double SYNC_OUTLIER_ABS_US = 5000.0;
   static constexpr uint32_t SYNC_DIAG_INTERVAL_MS = 200;
 
   // ESP-NOW/FreeRTOS C 风格回调转发到当前 ImuSlaveApp。
@@ -77,6 +80,7 @@ class ImuSlaveApp {
   // 初始化 ESP-NOW 和发送功率。
   bool initEspNow();
   bool loadClockModel(double &slope, double &intercept);
+  bool loadSampleClockModel(double &slope, double &intercept);
   // 读取 Master MAC 地址。
   bool loadMasterMac(uint8_t outMac[6]);
   // 处理 Master Beacon。
@@ -90,8 +94,12 @@ class ImuSlaveApp {
   void resetSyncFitLocked();
   void recordBeaconLocked(uint32_t localRecvUs, uint32_t masterTimeUs, uint16_t beaconSeq);
   void updateClockFitLocked();
+  // 对同步窗口执行一次最小二乘拟合，可选 includeMask 用于第二遍剔除离群点。
+  bool fitClockModelLocked(const bool *includeMask, double &slope, double &intercept, double &residualRms);
+  void freezeSampleClockLocked();
   void sendSyncDiag();
   uint32_t localToMasterTimeUs(uint32_t localUs);
+  uint32_t localToSampleTimeUs(uint32_t localUs);
   uint8_t currentState() const;
   // 推进最早未确认 batch 指针。
   void advanceOldestUnackedLocked();
@@ -116,10 +124,13 @@ class ImuSlaveApp {
   uint32_t pendingStreamStartUs_ = 0;
   double clockSlope_ = 1.0;
   double clockIntercept_ = 0.0;
+  double sampleClockSlope_ = 1.0;
+  double sampleClockIntercept_ = 0.0;
   int32_t syncOffsetUs_ = 0;
   int32_t syncDriftPpm_ = 0;
   int32_t syncResidualUs_ = 0;
   bool clockModelValid_ = false;
+  bool sampleClockModelValid_ = false;
   bool streamStarted_ = false;
   SyncPoint syncPoints_[SYNC_WINDOW_CAPACITY] = {};
   uint8_t syncPointCount_ = 0;
