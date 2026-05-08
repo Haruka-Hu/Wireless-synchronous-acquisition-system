@@ -30,7 +30,8 @@ class MasterApp {
   // ESP-NOW 回调只负责把原始包塞进队列，后续解码在无线任务中做。
   struct SlaveRxItem {
     uint8_t mac[6];
-    capture::ImuBatchWirePacket packet;
+    uint8_t len;
+    uint8_t bytes[capture::IMU_BATCH_WIRE_SIZE];
   };
 
   // 用于诊断在线状态，不参与可靠传输确认窗口。
@@ -66,6 +67,7 @@ class MasterApp {
   static void serialTxTaskStatic(void *arg);
   static void wirelessTaskStatic(void *arg);
   static void sensorTaskStatic(void *arg);
+  static void serialCommandTaskStatic(void *arg);
 
   // ADS1298 DRDY ISR 的实例处理函数。
   void onAdsDrdyFromIsr();
@@ -77,6 +79,7 @@ class MasterApp {
   void wirelessTask();
   // ADS1298 采样任务主体。
   void sensorTask();
+  void serialCommandTask();
 
   // 无线和 ACK 窗口管理。
   // 初始化 ESP-NOW 通道和广播 peer。
@@ -109,12 +112,22 @@ class MasterApp {
   void writeSerialBytesAll(const uint8_t *data, size_t size);
   // 写入一条诊断帧。
   void writeDiagFrame(uint32_t timestampUs, int32_t forwardedPerSec, int32_t errorsPerSec, int32_t onlineSlaveCount);
+  void writePcSyncDiag(const capture::SyncDiagPacket &diag);
+  void writePcStateEvent(const capture::StateAckPacket &event);
+  void handlePcCommand(String raw);
+  void transitionTo(uint8_t newState, uint32_t effectiveMasterTimeUs);
+  void broadcastCommand(uint8_t targetState, uint32_t effectiveMasterTimeUs);
+  void broadcastBeacon(uint32_t nowUs);
+  void resetStreamingState();
+  uint8_t currentState() const;
+  uint32_t beaconIntervalMs(uint8_t state) const;
 
   Config config_;
   Ads1298Driver ads_;
   TaskHandle_t sensorTaskHandle_ = nullptr;
   QueueHandle_t slaveRxQueue_ = nullptr;
   QueueHandle_t serialQueue_ = nullptr;
+  SemaphoreHandle_t serialWriteMux_ = nullptr;
   uint8_t broadcastMac_[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
   // 下面这些计数器每秒汇总为 SOURCE_DIAG，方便 PC 端观察链路质量。
@@ -130,6 +143,11 @@ class MasterApp {
   uint32_t slaveMissingPackets_ = 0;
   uint32_t ackSendFails_ = 0;
   uint8_t pcSerialSequence_ = 0;
+  uint8_t pcEventSequence_ = 0;
+  uint16_t commandSeq_ = 0;
+  uint16_t beaconSeq_ = 0;
+  volatile uint8_t state_ = capture::STATE_IDLE;
+  uint32_t pendingStreamStartUs_ = 0;
   uint32_t emgSampleSeq_ = 0;
 
   SlaveTracker slaveTrackers_[MAX_TRACKED_SLAVES] = {};

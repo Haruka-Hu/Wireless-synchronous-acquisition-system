@@ -69,6 +69,21 @@ bool macEquals(const uint8_t a[6], const uint8_t b[6]) {
   return true;
 }
 
+const char *stateName(uint8_t state) {
+  switch (state) {
+    case STATE_IDLE:
+      return "IDLE";
+    case STATE_SYNC:
+      return "SYNC";
+    case STATE_STREAM_PENDING:
+      return "STREAM_PENDING";
+    case STATE_STREAM:
+      return "STREAM";
+    default:
+      return "UNKNOWN";
+  }
+}
+
 void writeImuBatchCrc(ImuBatchWirePacket &packet) {
   const uint16_t crc = crc16Ccitt(packet.bytes, IMU_BATCH_WIRE_SIZE - 2);
   encodeU16LE(&packet.bytes[IMU_BATCH_WIRE_SIZE - 2], crc);
@@ -209,6 +224,98 @@ void buildAckPacket(uint8_t source,
   encodeU16LE(&outBytes[IMU_ACK_WIRE_SIZE - 2], crc);
 }
 
+void buildCommandPacket(uint16_t commandSeq,
+                        uint8_t targetState,
+                        uint32_t effectiveMasterTimeUs,
+                        uint8_t outBytes[COMMAND_WIRE_SIZE]) {
+  memset(outBytes, 0, COMMAND_WIRE_SIZE);
+  outBytes[0] = MSG_TYPE_COMMAND;
+  encodeU16LE(&outBytes[1], commandSeq);
+  outBytes[3] = targetState;
+  encodeU32LE(&outBytes[4], effectiveMasterTimeUs);
+  const uint16_t crc = crc16Ccitt(outBytes, COMMAND_WIRE_SIZE - 2);
+  encodeU16LE(&outBytes[COMMAND_WIRE_SIZE - 2], crc);
+}
+
+bool decodeCommandPacket(const uint8_t *data, int len, CommandPacket &outCommand) {
+  if (data == nullptr || len != static_cast<int>(COMMAND_WIRE_SIZE) || data[0] != MSG_TYPE_COMMAND) {
+    return false;
+  }
+  const uint16_t receivedCrc = decodeU16LE(&data[COMMAND_WIRE_SIZE - 2]);
+  const uint16_t calculatedCrc = crc16Ccitt(data, COMMAND_WIRE_SIZE - 2);
+  if (receivedCrc != calculatedCrc) {
+    return false;
+  }
+  outCommand.commandSeq = decodeU16LE(&data[1]);
+  outCommand.targetState = data[3];
+  outCommand.effectiveMasterTimeUs = decodeU32LE(&data[4]);
+  return outCommand.targetState <= STATE_STREAM;
+}
+
+void buildStateAckPacket(uint8_t source,
+                         uint8_t state,
+                         uint16_t commandSeq,
+                         uint32_t effectiveMasterTimeUs,
+                         uint8_t outBytes[STATE_ACK_WIRE_SIZE]) {
+  memset(outBytes, 0, STATE_ACK_WIRE_SIZE);
+  outBytes[0] = MSG_TYPE_STATE_ACK;
+  outBytes[1] = source;
+  outBytes[2] = state;
+  encodeU16LE(&outBytes[3], commandSeq);
+  encodeU32LE(&outBytes[5], effectiveMasterTimeUs);
+  const uint16_t crc = crc16Ccitt(outBytes, STATE_ACK_WIRE_SIZE - 2);
+  encodeU16LE(&outBytes[STATE_ACK_WIRE_SIZE - 2], crc);
+}
+
+bool decodeStateAckPacket(const uint8_t *data, int len, StateAckPacket &outAck) {
+  if (data == nullptr || len != static_cast<int>(STATE_ACK_WIRE_SIZE) || data[0] != MSG_TYPE_STATE_ACK) {
+    return false;
+  }
+  const uint16_t receivedCrc = decodeU16LE(&data[STATE_ACK_WIRE_SIZE - 2]);
+  const uint16_t calculatedCrc = crc16Ccitt(data, STATE_ACK_WIRE_SIZE - 2);
+  if (receivedCrc != calculatedCrc) {
+    return false;
+  }
+  outAck.source = data[1];
+  outAck.state = data[2];
+  outAck.commandSeq = decodeU16LE(&data[3]);
+  outAck.effectiveMasterTimeUs = decodeU32LE(&data[5]);
+  return outAck.state <= STATE_STREAM;
+}
+
+void buildSyncDiagPacket(const SyncDiagPacket &diag, uint8_t outBytes[SYNC_DIAG_WIRE_SIZE]) {
+  memset(outBytes, 0, SYNC_DIAG_WIRE_SIZE);
+  outBytes[0] = MSG_TYPE_SYNC_DIAG;
+  outBytes[1] = diag.source;
+  outBytes[2] = diag.state;
+  encodeU16LE(&outBytes[3], diag.beaconSeq);
+  encodeI32LE(&outBytes[5], diag.offsetUs);
+  encodeI32LE(&outBytes[9], diag.driftPpm);
+  encodeI32LE(&outBytes[13], diag.residualUs);
+  encodeU16LE(&outBytes[17], diag.beaconCount);
+  const uint16_t crc = crc16Ccitt(outBytes, SYNC_DIAG_WIRE_SIZE - 2);
+  encodeU16LE(&outBytes[SYNC_DIAG_WIRE_SIZE - 2], crc);
+}
+
+bool decodeSyncDiagPacket(const uint8_t *data, int len, SyncDiagPacket &outDiag) {
+  if (data == nullptr || len != static_cast<int>(SYNC_DIAG_WIRE_SIZE) || data[0] != MSG_TYPE_SYNC_DIAG) {
+    return false;
+  }
+  const uint16_t receivedCrc = decodeU16LE(&data[SYNC_DIAG_WIRE_SIZE - 2]);
+  const uint16_t calculatedCrc = crc16Ccitt(data, SYNC_DIAG_WIRE_SIZE - 2);
+  if (receivedCrc != calculatedCrc) {
+    return false;
+  }
+  outDiag.source = data[1];
+  outDiag.state = data[2];
+  outDiag.beaconSeq = decodeU16LE(&data[3]);
+  outDiag.offsetUs = static_cast<int32_t>(decodeU32LE(&data[5]));
+  outDiag.driftPpm = static_cast<int32_t>(decodeU32LE(&data[9]));
+  outDiag.residualUs = static_cast<int32_t>(decodeU32LE(&data[13]));
+  outDiag.beaconCount = decodeU16LE(&data[17]);
+  return outDiag.state <= STATE_STREAM;
+}
+
 // USB CDC 帧也带 CRC，PC 端可以发现串口半帧、错位或解析版本不一致。
 size_t buildPcBatchPacket(const PcSample *samples, uint8_t count, uint8_t sequence, uint8_t *outBytes) {
   outBytes[0] = PACKET_HEAD_0;
@@ -233,6 +340,39 @@ size_t buildPcBatchPacket(const PcSample *samples, uint8_t count, uint8_t sequen
   const uint16_t crc = crc16Ccitt(outBytes, offset);
   encodeU16LE(&outBytes[offset], crc);
   return offset + 2;
+}
+
+size_t buildPcSyncDiagPacket(const SyncDiagPacket &diag, uint8_t sequence, uint8_t *outBytes) {
+  outBytes[0] = PACKET_HEAD_0;
+  outBytes[1] = PACKET_HEAD_1;
+  outBytes[2] = PC_MSG_SYNC_DIAG;
+  outBytes[3] = sequence;
+  outBytes[4] = diag.source;
+  outBytes[5] = diag.state;
+  encodeU16LE(&outBytes[6], diag.beaconSeq);
+  encodeI32LE(&outBytes[8], diag.offsetUs);
+  encodeI32LE(&outBytes[12], diag.driftPpm);
+  encodeI32LE(&outBytes[16], diag.residualUs);
+  encodeU16LE(&outBytes[20], diag.beaconCount);
+  const size_t payloadEnd = 22;
+  const uint16_t crc = crc16Ccitt(outBytes, payloadEnd);
+  encodeU16LE(&outBytes[payloadEnd], crc);
+  return payloadEnd + 2;
+}
+
+size_t buildPcStateEventPacket(const StateAckPacket &event, uint8_t sequence, uint8_t *outBytes) {
+  outBytes[0] = PACKET_HEAD_0;
+  outBytes[1] = PACKET_HEAD_1;
+  outBytes[2] = PC_MSG_STATE_EVENT;
+  outBytes[3] = sequence;
+  outBytes[4] = event.source;
+  outBytes[5] = event.state;
+  encodeU16LE(&outBytes[6], event.commandSeq);
+  encodeU32LE(&outBytes[8], event.effectiveMasterTimeUs);
+  const size_t payloadEnd = 12;
+  const uint16_t crc = crc16Ccitt(outBytes, payloadEnd);
+  encodeU16LE(&outBytes[payloadEnd], crc);
+  return payloadEnd + 2;
 }
 
 }  // namespace capture

@@ -48,11 +48,17 @@ from PySide6.QtWidgets import (
 
 FRAME_HEADER = b"\xAA\x55"
 PC_MSG_SAMPLE_BATCH = 0x30
+PC_MSG_SYNC_DIAG = 0x31
+PC_MSG_STATE_EVENT = 0x32
 PC_BATCH_HEADER_SIZE = 5
 PC_SAMPLE_SIZE = 24
 PC_MAX_BATCH_SAMPLES = 24
 PC_BATCH_MIN_SIZE = PC_BATCH_HEADER_SIZE + PC_SAMPLE_SIZE + 2
 PC_SAMPLE_STRUCT = struct.Struct("<BIIHBiii")
+PC_SYNC_DIAG_SIZE = 24
+PC_SYNC_DIAG_STRUCT = struct.Struct("<BBHiiiH")
+PC_STATE_EVENT_SIZE = 14
+PC_STATE_EVENT_STRUCT = struct.Struct("<BBHI")
 
 SOURCE_EMG = 0x00
 SOURCE_GYRO = 0x01
@@ -95,9 +101,20 @@ SOURCE_PLOT_META = {
 UINT32_WRAP = 2**32
 INT32_HALF_WRAP = 2**31
 STREAM_MIN_SIZE = PC_BATCH_MIN_SIZE
+MIN_FRAME_SIZE = 7
 # CRC 已经证明帧边界有效；时间戳只用于发现断线/重同步后的时间轴跳变。
 TIMESTAMP_RELOCK_GAP_US = 250_000
 TIMESTAMP_RELOCK_BACKWARD_US = 2_000
+SYNC_STABLE_WINDOW_S = 3.0
+SYNC_STABLE_RESIDUAL_US = 3_000
+SYNC_STABLE_DRIFT_RANGE_PPM = 20
+
+STATE_NAMES = {
+    0: "IDLE",
+    1: "SYNC",
+    2: "STREAM_PENDING",
+    3: "STREAM",
+}
 
 
 def signed_delta_us(timestamp_us: np.ndarray, reference_us: int) -> np.ndarray:
@@ -199,6 +216,27 @@ class ParserStats:
     last_reader_error: str = ""
 
 
+@dataclass
+class SyncDiag:
+    host_rx_time: float
+    source_id: int
+    state: int
+    beacon_seq: int
+    offset_us: int
+    drift_ppm: int
+    residual_us: int
+    beacon_count: int
+
+
+@dataclass
+class StateEvent:
+    host_rx_time: float
+    source_id: int
+    state: int
+    command_seq: int
+    effective_master_time_us: int
+
+
 class AcquisitionModel:
     def __init__(self, max_points: int, emg_display_rate: float) -> None:
         """初始化采集缓存、EMG 显示滤波器和 CSV/诊断状态。"""
@@ -231,9 +269,17 @@ class AcquisitionModel:
         self.is_recording = False
         self.csv_fp = None
         self.csv_writer = None
+        self.sync_csv_fp = None
+        self.sync_csv_writer = None
         self.diag_forwarded_per_sec = 0
         self.diag_errors_per_sec = 0
         self.diag_online_slave_count = 0
+        self.system_state = 0
+        self.state_events: deque[StateEvent] = deque(maxlen=200)
+        self.sync_diag = {
+            SOURCE_GYRO: deque(maxlen=500),
+            SOURCE_ACCEL: deque(maxlen=500),
+        }
         self.parser_stats = ParserStats()
 
     def clear_source(self, source_id: int) -> None:
@@ -343,6 +389,54 @@ class AcquisitionModel:
             self.diag_errors_per_sec = errors_per_sec
             self.diag_online_slave_count = online_slave_count
 
+    def update_sync_diag(
+        self,
+        source_id: int,
+        state: int,
+        beacon_seq: int,
+        offset_us: int,
+        drift_ppm: int,
+        residual_us: int,
+        beacon_count: int,
+    ) -> None:
+        """更新某个 Slave 的同步拟合诊断，并在录制时写入 sync CSV。"""
+        diag = SyncDiag(
+            host_rx_time=time.time(),
+            source_id=source_id,
+            state=state,
+            beacon_seq=beacon_seq,
+            offset_us=offset_us,
+            drift_ppm=drift_ppm,
+            residual_us=residual_us,
+            beacon_count=beacon_count,
+        )
+        with self.lock:
+            if source_id not in self.sync_diag:
+                self.sync_diag[source_id] = deque(maxlen=500)
+            self.sync_diag[source_id].append(diag)
+            if self.is_recording and self.sync_csv_writer is not None:
+                self.sync_csv_writer.writerow(
+                    [
+                        f"{diag.host_rx_time:.6f}",
+                        SOURCE_NAMES.get(source_id, f"Unknown({source_id})"),
+                        source_id,
+                        STATE_NAMES.get(state, str(state)),
+                        beacon_seq,
+                        offset_us,
+                        drift_ppm,
+                        residual_us,
+                        beacon_count,
+                    ]
+                )
+
+    def update_state_event(self, source_id: int, state: int, command_seq: int, effective_master_time_us: int) -> None:
+        """更新 Master 或 Slave 的状态 ACK 事件。"""
+        event = StateEvent(time.time(), source_id, state, command_seq, effective_master_time_us)
+        with self.lock:
+            self.state_events.append(event)
+            if source_id == SOURCE_EMG:
+                self.system_state = state
+
     def reference_timestamp_us(self) -> int | None:
         """选择最近收到数据的 source 作为显示时间轴参考。"""
         with self.lock:
@@ -402,6 +496,15 @@ class AcquisitionModel:
                     reader_errors=self.parser_stats.reader_errors,
                     last_reader_error=self.parser_stats.last_reader_error,
                 ),
+            )
+
+    def sync_snapshot(self) -> tuple[int, dict[int, list[SyncDiag]], list[StateEvent]]:
+        """返回同步诊断和状态事件快照。"""
+        with self.lock:
+            return (
+                self.system_state,
+                {source_id: list(values) for source_id, values in self.sync_diag.items()},
+                list(self.state_events),
             )
 
     def note_crc_fail(self) -> None:
@@ -468,6 +571,22 @@ class AcquisitionModel:
                     "vector_norm",
                 ]
             )
+            sync_path = csv_dir / f"sync_diag_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            self.sync_csv_fp = sync_path.open("w", newline="", encoding="utf-8")
+            self.sync_csv_writer = csv.writer(self.sync_csv_fp)
+            self.sync_csv_writer.writerow(
+                [
+                    "host_rx_time",
+                    "source",
+                    "source_id",
+                    "state",
+                    "beacon_seq",
+                    "offset_us",
+                    "drift_ppm",
+                    "residual_us",
+                    "beacon_count",
+                ]
+            )
             self.is_recording = True
             return csv_path
 
@@ -477,8 +596,12 @@ class AcquisitionModel:
             self.is_recording = False
             if self.csv_fp is not None:
                 self.csv_fp.close()
+            if self.sync_csv_fp is not None:
+                self.sync_csv_fp.close()
             self.csv_fp = None
             self.csv_writer = None
+            self.sync_csv_fp = None
+            self.sync_csv_writer = None
 
 
 class SerialReader(threading.Thread):
@@ -491,6 +614,7 @@ class SerialReader(threading.Thread):
         self.stop_event = threading.Event()
         self.serial_port: serial.Serial | None = None
         self.last_timestamp_us: dict[int, int] = {}
+        self.write_lock = threading.Lock()
 
     def open(self) -> None:
         """打开串口并设置 DTR/RTS，准备接收 Master CDC 数据。"""
@@ -506,6 +630,15 @@ class SerialReader(threading.Thread):
     def stop(self) -> None:
         """请求串口读取线程退出。"""
         self.stop_event.set()
+
+    def send_text_command(self, command: str) -> None:
+        """向 Master 发送一条以换行结尾的文本控制命令。"""
+        if self.serial_port is None or not self.serial_port.is_open:
+            raise RuntimeError("串口尚未打开。")
+        payload = f"{command.strip()}\n".encode("utf-8")
+        with self.write_lock:
+            self.serial_port.write(payload)
+            self.serial_port.flush()
 
     def note_timestamp(self, source_id: int, timestamp_us: int) -> None:
         """检查到达顺序中的时间戳异常，并在必要时触发 EMG 重锁。"""
@@ -551,7 +684,7 @@ class SerialReader(threading.Thread):
                 else:
                     time.sleep(0.001)
 
-                while len(raw_buffer) >= STREAM_MIN_SIZE:
+                while len(raw_buffer) >= MIN_FRAME_SIZE:
                     idx = raw_buffer.find(FRAME_HEADER)
                     if idx == -1:
                         self.model.note_resync_bytes(max(0, len(raw_buffer) - 1))
@@ -562,13 +695,49 @@ class SerialReader(threading.Thread):
                         self.model.note_resync_bytes(idx)
                         raw_buffer = raw_buffer[idx:]
 
-                    if len(raw_buffer) < PC_BATCH_HEADER_SIZE:
+                    if len(raw_buffer) < 4:
                         break
 
-                    if raw_buffer[2] != PC_MSG_SAMPLE_BATCH:
+                    frame_type = raw_buffer[2]
+                    if frame_type == PC_MSG_SYNC_DIAG:
+                        if len(raw_buffer) < PC_SYNC_DIAG_SIZE:
+                            break
+                        frame = raw_buffer[:PC_SYNC_DIAG_SIZE]
+                        received_crc = int.from_bytes(frame[-2:], byteorder="little", signed=False)
+                        calculated_crc = crc16_ccitt(frame[:-2])
+                        if received_crc != calculated_crc:
+                            self.model.note_crc_fail()
+                            raw_buffer = raw_buffer[1:]
+                            continue
+                        source_id, state, beacon_seq, offset_us, drift_ppm, residual_us, beacon_count = PC_SYNC_DIAG_STRUCT.unpack(
+                            frame[4:-2]
+                        )
+                        self.model.update_sync_diag(source_id, state, beacon_seq, offset_us, drift_ppm, residual_us, beacon_count)
+                        raw_buffer = raw_buffer[PC_SYNC_DIAG_SIZE:]
+                        continue
+
+                    if frame_type == PC_MSG_STATE_EVENT:
+                        if len(raw_buffer) < PC_STATE_EVENT_SIZE:
+                            break
+                        frame = raw_buffer[:PC_STATE_EVENT_SIZE]
+                        received_crc = int.from_bytes(frame[-2:], byteorder="little", signed=False)
+                        calculated_crc = crc16_ccitt(frame[:-2])
+                        if received_crc != calculated_crc:
+                            self.model.note_crc_fail()
+                            raw_buffer = raw_buffer[1:]
+                            continue
+                        source_id, state, command_seq, effective_master_time_us = PC_STATE_EVENT_STRUCT.unpack(frame[4:-2])
+                        self.model.update_state_event(source_id, state, command_seq, effective_master_time_us)
+                        raw_buffer = raw_buffer[PC_STATE_EVENT_SIZE:]
+                        continue
+
+                    if frame_type != PC_MSG_SAMPLE_BATCH:
                         self.model.note_bad_header()
                         raw_buffer = raw_buffer[1:]
                         continue
+
+                    if len(raw_buffer) < PC_BATCH_HEADER_SIZE:
+                        break
 
                     sample_count = raw_buffer[3]
                     if sample_count == 0 or sample_count > PC_MAX_BATCH_SAMPLES:
@@ -619,10 +788,11 @@ class SerialReader(threading.Thread):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, model: AcquisitionModel, csv_dir: Path, port: str, baud: int, window_seconds: float) -> None:
+    def __init__(self, model: AcquisitionModel, reader: SerialReader, csv_dir: Path, port: str, baud: int, window_seconds: float) -> None:
         """创建示波器主窗口、曲线、状态栏和定时刷新器。"""
         super().__init__()
         self.model = model
+        self.reader = reader
         self.csv_dir = csv_dir
         self.port = port
         self.baud = baud
@@ -654,17 +824,28 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
 
         top_row = QHBoxLayout()
+        self.sync_button = QPushButton("开始同步")
+        self.stream_button = QPushButton("开始采集")
+        self.stop_button = QPushButton("停止")
         self.record_button = QPushButton("开始录制 CSV")
+        self.sync_button.clicked.connect(lambda: self.send_control_command("START_SYNC"))
+        self.stream_button.clicked.connect(lambda: self.send_control_command("START_STREAM"))
+        self.stop_button.clicked.connect(lambda: self.send_control_command("STOP"))
         self.record_button.setStyleSheet(
             "background-color: #2E7D32; color: white; font-weight: bold; padding: 8px 14px;"
         )
         self.record_button.clicked.connect(self.toggle_recording)
+        top_row.addWidget(self.sync_button)
+        top_row.addWidget(self.stream_button)
+        top_row.addWidget(self.stop_button)
         top_row.addWidget(self.record_button)
         status_column = QVBoxLayout()
         self.primary_status_label = QLabel(f"串口 {self.port} @ {self.baud}")
         self.link_status_label = QLabel("Slave-01 -- | Slave-02 --")
+        self.sync_status_label = QLabel("State IDLE | Sync --")
         status_column.addWidget(self.primary_status_label)
         status_column.addWidget(self.link_status_label)
+        status_column.addWidget(self.sync_status_label)
         top_row.addLayout(status_column)
         top_row.addStretch()
         main_layout.addLayout(top_row)
@@ -774,6 +955,32 @@ class MainWindow(QMainWindow):
         state = "在线" if is_online else "离线"
         return f"{name} {state} {self.source_rates[source_id]:.0f}/s"
 
+    def send_control_command(self, command: str) -> None:
+        """发送 START_SYNC/START_STREAM/STOP 到 Master。"""
+        try:
+            self.reader.send_text_command(command)
+            self.primary_status_label.setText(f"已发送控制命令: {command}")
+        except Exception as exc:
+            QMessageBox.warning(self, "命令发送失败", str(exc))
+
+    def _format_sync_line(self, name: str, values: list[SyncDiag], now: float) -> str:
+        """格式化某个 Slave 的同步诊断和稳定性提示。"""
+        if not values:
+            return f"{name} --"
+        latest = values[-1]
+        recent = [item for item in values if now - item.host_rx_time <= SYNC_STABLE_WINDOW_S]
+        stable = False
+        if len(recent) >= 5:
+            residual_ok = all(abs(item.residual_us) <= SYNC_STABLE_RESIDUAL_US for item in recent)
+            drift_values = [item.drift_ppm for item in recent]
+            drift_ok = max(drift_values) - min(drift_values) <= SYNC_STABLE_DRIFT_RANGE_PPM
+            stable = residual_ok and drift_ok
+        state = "稳定" if stable else "未稳"
+        return (
+            f"{name} {state} off {latest.offset_us}us drift {latest.drift_ppm}ppm "
+            f"res {latest.residual_us}us n {latest.beacon_count}"
+        )
+
     def update_plots(self) -> None:
         """Qt 定时器回调：刷新曲线、速率和诊断状态栏。"""
         reference_timestamp_us = self.model.reference_timestamp_us()
@@ -808,6 +1015,7 @@ class MainWindow(QMainWindow):
         self._update_source_rates(current_counts, now)
 
         diag_forwarded, diag_errors, diag_online, parser_stats = self.model.diag_snapshot()
+        system_state, sync_diag, state_events = self.model.sync_snapshot()
         emg_count = self.last_counts[SOURCE_EMG] if self.last_counts[SOURCE_EMG] >= 0 else 0
         gyro_count = self.last_counts[SOURCE_GYRO] if self.last_counts[SOURCE_GYRO] >= 0 else 0
         accel_count = self.last_counts[SOURCE_ACCEL] if self.last_counts[SOURCE_ACCEL] >= 0 else 0
@@ -835,6 +1043,18 @@ class MainWindow(QMainWindow):
             f"bad src {parser_stats.bad_sources} | bad cnt {parser_stats.bad_counts} | "
             f"ts rej {parser_stats.bad_timestamps} | resync {parser_stats.resync_bytes}B"
             f"{reader_error_text}"
+        )
+        gyro_sync = self._format_sync_line("Gyro", sync_diag.get(SOURCE_GYRO, []), now)
+        accel_sync = self._format_sync_line("Accel", sync_diag.get(SOURCE_ACCEL, []), now)
+        last_event = state_events[-1] if state_events else None
+        event_text = ""
+        if last_event is not None:
+            event_text = (
+                f" | last ACK {SOURCE_NAMES.get(last_event.source_id, last_event.source_id)} "
+                f"{STATE_NAMES.get(last_event.state, last_event.state)} seq {last_event.command_seq}"
+            )
+        self.sync_status_label.setText(
+            f"State {STATE_NAMES.get(system_state, system_state)} | {gyro_sync} | {accel_sync}{event_text}"
         )
 
     def toggle_recording(self) -> None:
@@ -886,7 +1106,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     pg.setConfigOptions(antialias=False, foreground="#EAEAEA", background="#101418")
 
-    window = MainWindow(model, args.csv_dir, port, args.baud, args.window_seconds)
+    window = MainWindow(model, reader, args.csv_dir, port, args.baud, args.window_seconds)
     window.show()
 
     exit_code = 0

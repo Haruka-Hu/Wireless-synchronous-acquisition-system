@@ -13,6 +13,8 @@ namespace capture {
 constexpr uint8_t PACKET_HEAD_0 = 0xAA;
 constexpr uint8_t PACKET_HEAD_1 = 0x55;
 constexpr uint8_t PC_MSG_SAMPLE_BATCH = 0x30;
+constexpr uint8_t PC_MSG_SYNC_DIAG = 0x31;
+constexpr uint8_t PC_MSG_STATE_EVENT = 0x32;
 
 // 统一 source 编号。0x01..0x6F 留给无线 Slave，0x7E 单独作为诊断帧。
 constexpr uint8_t SOURCE_EMG = 0x00;
@@ -20,11 +22,21 @@ constexpr uint8_t SOURCE_DIAG = 0x7E;
 constexpr uint8_t SLAVE_SOURCE_MIN = 0x01;
 constexpr uint8_t SLAVE_SOURCE_MAX = 0x6F;
 
-// ESP-NOW 链路的消息类型。Beacon 做时间同步，IMU_BATCH 传数据，IMU_ACK 做确认。
+// ESP-NOW 链路的消息类型。Beacon 做时间同步，COMMAND 做状态切换，IMU_BATCH 传数据。
 constexpr uint8_t MSG_TYPE_BEACON = 0x10;
 constexpr uint8_t MSG_TYPE_IMU_ACK = 0x11;
+constexpr uint8_t MSG_TYPE_COMMAND = 0x12;
+constexpr uint8_t MSG_TYPE_STATE_ACK = 0x13;
 constexpr uint8_t MSG_TYPE_IMU_BATCH = 0x20;
+constexpr uint8_t MSG_TYPE_SYNC_DIAG = 0x21;
 constexpr uint8_t ESPNOW_CHANNEL = 1;
+
+enum SystemState : uint8_t {
+  STATE_IDLE = 0,
+  STATE_SYNC = 1,
+  STATE_STREAM_PENDING = 2,
+  STATE_STREAM = 3,
+};
 
 // IMU batch 固定传 20 个 sample 槽位。count 可以小于 20，但空口长度保持固定，便于队列和解析。
 constexpr size_t IMU_BATCH_SIZE = 20;
@@ -32,6 +44,11 @@ constexpr size_t IMU_SAMPLE_WIRE_SIZE = 8;
 constexpr size_t IMU_BATCH_HEADER_SIZE = 14;
 constexpr size_t IMU_BATCH_WIRE_SIZE = IMU_BATCH_HEADER_SIZE + IMU_BATCH_SIZE * IMU_SAMPLE_WIRE_SIZE + 2;
 constexpr size_t IMU_ACK_WIRE_SIZE = 18;
+constexpr size_t COMMAND_WIRE_SIZE = 10;
+constexpr size_t STATE_ACK_WIRE_SIZE = 11;
+constexpr size_t SYNC_DIAG_WIRE_SIZE = 21;
+constexpr size_t PC_SYNC_DIAG_PAYLOAD_SIZE = 17;
+constexpr size_t PC_STATE_EVENT_PAYLOAD_SIZE = 8;
 
 // flags 会原样进入 CSV 的 rx_flags 字段，用来判断重传和实验段是否有效。
 constexpr uint8_t IMU_FLAG_RETRANSMIT = 0x01;
@@ -47,8 +64,36 @@ constexpr size_t PC_SERIAL_MAX_PACKET_SIZE = PC_SERIAL_HEADER_SIZE + PC_SERIAL_M
 // Master 广播的时间信标。结构体 packed 后直接通过 ESP-NOW 发送。
 struct BeaconPacket {
   uint8_t type;
+  uint16_t beaconSeq;
+  uint8_t state;
   uint32_t masterTimeUs;
 } __attribute__((packed));
+
+// PC->Master 文本命令会被 Master 转成这个 ESP-NOW 状态命令。
+struct CommandPacket {
+  uint16_t commandSeq;
+  uint8_t targetState;
+  uint32_t effectiveMasterTimeUs;
+};
+
+// Slave 收到状态命令后回 ACK，Master 再转成 PC 状态事件。
+struct StateAckPacket {
+  uint8_t source;
+  uint8_t state;
+  uint16_t commandSeq;
+  uint32_t effectiveMasterTimeUs;
+};
+
+// Slave 在 SYNC 阶段发送的线性时钟拟合诊断。
+struct SyncDiagPacket {
+  uint8_t source;
+  uint8_t state;
+  uint16_t beaconSeq;
+  int32_t offsetUs;
+  int32_t driftPpm;
+  int32_t residualUs;
+  uint16_t beaconCount;
+};
 
 // Slave 采样任务内部使用的原始样本：时间戳已经换算到 Master 时间轴。
 struct ImuRawSample {
@@ -113,6 +158,7 @@ void encodeI16LE(uint8_t *dst, int16_t value);
 void encodeI32LE(uint8_t *dst, int32_t value);
 // 比较两个 ESP-NOW MAC 地址是否一致。
 bool macEquals(const uint8_t a[6], const uint8_t b[6]);
+const char *stateName(uint8_t state);
 
 // 重新写入 batch 末尾 CRC。重传或故障 flags 变化后必须调用。
 void writeImuBatchCrc(ImuBatchWirePacket &packet);
@@ -147,7 +193,25 @@ void buildAckPacket(uint8_t source,
                     uint32_t masterTimeUs,
                     uint8_t outBytes[IMU_ACK_WIRE_SIZE]);
 
+void buildCommandPacket(uint16_t commandSeq,
+                        uint8_t targetState,
+                        uint32_t effectiveMasterTimeUs,
+                        uint8_t outBytes[COMMAND_WIRE_SIZE]);
+bool decodeCommandPacket(const uint8_t *data, int len, CommandPacket &outCommand);
+
+void buildStateAckPacket(uint8_t source,
+                         uint8_t state,
+                         uint16_t commandSeq,
+                         uint32_t effectiveMasterTimeUs,
+                         uint8_t outBytes[STATE_ACK_WIRE_SIZE]);
+bool decodeStateAckPacket(const uint8_t *data, int len, StateAckPacket &outAck);
+
+void buildSyncDiagPacket(const SyncDiagPacket &diag, uint8_t outBytes[SYNC_DIAG_WIRE_SIZE]);
+bool decodeSyncDiagPacket(const uint8_t *data, int len, SyncDiagPacket &outDiag);
+
 // 构造 Master -> PC 的 USB CDC 批量帧。
 size_t buildPcBatchPacket(const PcSample *samples, uint8_t count, uint8_t sequence, uint8_t *outBytes);
+size_t buildPcSyncDiagPacket(const SyncDiagPacket &diag, uint8_t sequence, uint8_t *outBytes);
+size_t buildPcStateEventPacket(const StateAckPacket &event, uint8_t sequence, uint8_t *outBytes);
 
 }  // namespace capture

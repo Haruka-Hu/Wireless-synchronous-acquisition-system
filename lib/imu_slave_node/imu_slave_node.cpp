@@ -2,6 +2,7 @@
 
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <math.h>
 #include <string.h>
 
 namespace {
@@ -69,8 +70,19 @@ void ImuSlaveApp::onEspNowSent(esp_now_send_status_t status) {
 
 // 根据下行包类型分发到 ACK 处理或 Beacon 时间同步处理。
 void ImuSlaveApp::onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
-  // Slave 接收两类下行包：ACK 用于释放缓存，Beacon 用于校准 Master 时间轴。
+  // Slave 接收三类下行包：COMMAND 切状态，ACK 释放缓存，Beacon 建立时钟模型。
   if (data == nullptr) {
+    return;
+  }
+  if (mac != nullptr) {
+    portENTER_CRITICAL(&offsetMux_);
+    memcpy(masterMac_, mac, 6);
+    hasMasterMac_ = true;
+    portEXIT_CRITICAL(&offsetMux_);
+  }
+
+  if (len == static_cast<int>(capture::COMMAND_WIRE_SIZE) && data[0] == capture::MSG_TYPE_COMMAND) {
+    handleCommandPacket(data, len);
     return;
   }
 
@@ -99,15 +111,14 @@ bool ImuSlaveApp::initEspNow() {
   return true;
 }
 
-// 线程安全读取当前 Master-local 时间偏移；未同步时返回 false。
-bool ImuSlaveApp::loadTimeSync(int32_t &offsetUs) {
-  // offsetMux_ 保护 Beacon 回调和采样/发送任务共享的时间偏移。
-  bool synced = false;
+bool ImuSlaveApp::loadClockModel(double &slope, double &intercept) {
+  bool valid = false;
   portENTER_CRITICAL(&offsetMux_);
-  synced = hasTimeOffset_;
-  offsetUs = timeOffsetUs_;
+  valid = clockModelValid_;
+  slope = clockSlope_;
+  intercept = clockIntercept_;
   portEXIT_CRITICAL(&offsetMux_);
-  return synced;
+  return valid;
 }
 
 // 线程安全读取最近收到 Beacon 的 Master MAC，用于后续单播发送。
@@ -124,7 +135,6 @@ bool ImuSlaveApp::loadMasterMac(uint8_t outMac[6]) {
 
 // 处理 Master Beacon，更新时间偏移和 Master MAC。
 void ImuSlaveApp::handleBeacon(const uint8_t *mac, const uint8_t *data, int len) {
-  // Beacon 只包含 Master 当前 micros()，Slave 用它估算本地到 Master 的时间偏移。
   if (len != static_cast<int>(sizeof(capture::BeaconPacket))) {
     return;
   }
@@ -135,35 +145,193 @@ void ImuSlaveApp::handleBeacon(const uint8_t *mac, const uint8_t *data, int len)
   }
 
   const uint32_t localNowUs = micros();
-  const int32_t measuredOffset = static_cast<int32_t>(packet.masterTimeUs - localNowUs);
-
-  portENTER_CRITICAL_ISR(&offsetMux_);
-  if (!hasTimeOffset_) {
-    timeOffsetUs_ = measuredOffset;
-    hasTimeOffset_ = true;
-    largeOffsetErrorCount_ = 0;
-  } else {
-    // 小误差做低通跟随；大误差需要连续出现几次才重锁，避免偶发 Beacon 抖动拉坏时间轴。
-    const int32_t offsetErrorUs = measuredOffset - timeOffsetUs_;
-    const int32_t absOffsetErrorUs = offsetErrorUs < 0 ? -offsetErrorUs : offsetErrorUs;
-    if (absOffsetErrorUs > TIME_OFFSET_RELOCK_ERROR_US) {
-      if (++largeOffsetErrorCount_ >= TIME_OFFSET_RELOCK_CONFIRMATIONS) {
-        timeOffsetUs_ = measuredOffset;
-        largeOffsetErrorCount_ = 0;
-      }
-    } else if (absOffsetErrorUs > TIME_OFFSET_SMALL_ERROR_US) {
-      timeOffsetUs_ += offsetErrorUs / 16;
-      largeOffsetErrorCount_ = 0;
-    } else {
-      timeOffsetUs_ = (timeOffsetUs_ * 7 + measuredOffset) / 8;
-      largeOffsetErrorCount_ = 0;
-    }
+  portENTER_CRITICAL(&offsetMux_);
+  if (state_ == capture::STATE_SYNC || state_ == capture::STATE_STREAM_PENDING) {
+    recordBeaconLocked(localNowUs, packet.masterTimeUs, packet.beaconSeq);
   }
   if (mac != nullptr) {
     memcpy(masterMac_, mac, 6);
     hasMasterMac_ = true;
   }
-  portEXIT_CRITICAL_ISR(&offsetMux_);
+  portEXIT_CRITICAL(&offsetMux_);
+}
+
+void ImuSlaveApp::handleCommandPacket(const uint8_t *data, int len) {
+  capture::CommandPacket command{};
+  if (!capture::decodeCommandPacket(data, len, command)) {
+    return;
+  }
+  applyState(command.targetState, command.commandSeq, command.effectiveMasterTimeUs);
+}
+
+uint8_t ImuSlaveApp::currentState() const {
+  return state_;
+}
+
+void ImuSlaveApp::resetRingLocked() {
+  for (size_t i = 0; i < BATCH_RING_CAPACITY; ++i) {
+    batchRing_[i] = {};
+  }
+  nextBatchSeq_ = 0;
+  oldestUnackedSeq_ = 0;
+  nextSampleSeq_ = 0;
+  ringOverflows_ = 0;
+  linkFaultPending_ = false;
+  ackPackets_ = 0;
+  ackedBatches_ = 0;
+  sendAttempts_ = 0;
+  sendFails_ = 0;
+}
+
+void ImuSlaveApp::resetSyncFitLocked() {
+  clockSlope_ = 1.0;
+  clockIntercept_ = 0.0;
+  syncOffsetUs_ = 0;
+  syncDriftPpm_ = 0;
+  syncResidualUs_ = 0;
+  clockModelValid_ = false;
+  syncPointCount_ = 0;
+  syncPointHead_ = 0;
+  lastBeaconSeq_ = 0;
+  lastSyncDiagMs_ = 0;
+}
+
+void ImuSlaveApp::applyState(uint8_t newState, uint16_t commandSeq, uint32_t effectiveMasterTimeUs) {
+  if (commandSeq == lastCommandSeq_) {
+    sendStateAck(commandSeq, effectiveMasterTimeUs);
+    return;
+  }
+  lastCommandSeq_ = commandSeq;
+
+  portENTER_CRITICAL(&ringMux_);
+  if (newState == capture::STATE_IDLE || newState == capture::STATE_SYNC || newState == capture::STATE_STREAM_PENDING) {
+    resetRingLocked();
+  }
+  portEXIT_CRITICAL(&ringMux_);
+
+  portENTER_CRITICAL(&offsetMux_);
+  state_ = newState;
+  pendingStreamStartUs_ = effectiveMasterTimeUs;
+  streamStarted_ = false;
+  if (newState == capture::STATE_SYNC) {
+    resetSyncFitLocked();
+  }
+  if (newState == capture::STATE_IDLE) {
+    streamStarted_ = false;
+  }
+  portEXIT_CRITICAL(&offsetMux_);
+
+  sendStateAck(commandSeq, effectiveMasterTimeUs);
+}
+
+void ImuSlaveApp::sendStateAck(uint16_t commandSeq, uint32_t effectiveMasterTimeUs) {
+  uint8_t masterMac[6] = {0};
+  if (!loadMasterMac(masterMac)) {
+    return;
+  }
+  if (!esp_now_is_peer_exist(masterMac)) {
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, masterMac, 6);
+    peerInfo.channel = capture::ESPNOW_CHANNEL;
+    peerInfo.encrypt = false;
+    peerInfo.ifidx = WIFI_IF_STA;
+    esp_now_add_peer(&peerInfo);
+  }
+  uint8_t packet[capture::STATE_ACK_WIRE_SIZE] = {};
+  capture::buildStateAckPacket(config_.nodeSource, currentState(), commandSeq, effectiveMasterTimeUs, packet);
+  esp_now_send(masterMac, packet, sizeof(packet));
+}
+
+void ImuSlaveApp::recordBeaconLocked(uint32_t localRecvUs, uint32_t masterTimeUs, uint16_t beaconSeq) {
+  syncPoints_[syncPointHead_] = {localRecvUs, masterTimeUs};
+  syncPointHead_ = static_cast<uint8_t>((syncPointHead_ + 1U) % SYNC_WINDOW_CAPACITY);
+  if (syncPointCount_ < SYNC_WINDOW_CAPACITY) {
+    ++syncPointCount_;
+  }
+  lastBeaconSeq_ = beaconSeq;
+  updateClockFitLocked();
+}
+
+void ImuSlaveApp::updateClockFitLocked() {
+  if (syncPointCount_ < 2) {
+    clockModelValid_ = false;
+    return;
+  }
+
+  const uint8_t oldestIndex = static_cast<uint8_t>((syncPointHead_ + SYNC_WINDOW_CAPACITY - syncPointCount_) % SYNC_WINDOW_CAPACITY);
+  const SyncPoint &base = syncPoints_[oldestIndex];
+  double sumX = 0.0;
+  double sumY = 0.0;
+  double sumXX = 0.0;
+  double sumXY = 0.0;
+
+  for (uint8_t i = 0; i < syncPointCount_; ++i) {
+    const uint8_t index = static_cast<uint8_t>((oldestIndex + i) % SYNC_WINDOW_CAPACITY);
+    const double x = static_cast<double>(static_cast<uint32_t>(syncPoints_[index].localUs - base.localUs));
+    const double y = static_cast<double>(static_cast<int32_t>(syncPoints_[index].masterUs - base.masterUs));
+    sumX += x;
+    sumY += y;
+    sumXX += x * x;
+    sumXY += x * y;
+  }
+
+  const double n = static_cast<double>(syncPointCount_);
+  const double denom = n * sumXX - sumX * sumX;
+  if (denom == 0.0) {
+    clockModelValid_ = false;
+    return;
+  }
+
+  const double slope = (n * sumXY - sumX * sumY) / denom;
+  const double interceptRel = (sumY - slope * sumX) / n;
+  clockSlope_ = slope;
+  clockIntercept_ = static_cast<double>(base.masterUs) + interceptRel - slope * static_cast<double>(base.localUs);
+
+  double residualSq = 0.0;
+  for (uint8_t i = 0; i < syncPointCount_; ++i) {
+    const uint8_t index = static_cast<uint8_t>((oldestIndex + i) % SYNC_WINDOW_CAPACITY);
+    const double predicted = slope * static_cast<double>(syncPoints_[index].localUs) + clockIntercept_;
+    const double error = predicted - static_cast<double>(syncPoints_[index].masterUs);
+    residualSq += error * error;
+  }
+
+  const uint32_t nowUs = micros();
+  const double nowMaster = clockSlope_ * static_cast<double>(nowUs) + clockIntercept_;
+  syncOffsetUs_ = static_cast<int32_t>(nowMaster - static_cast<double>(nowUs));
+  syncDriftPpm_ = static_cast<int32_t>((clockSlope_ - 1.0) * 1000000.0);
+  syncResidualUs_ = static_cast<int32_t>(sqrt(residualSq / n));
+  clockModelValid_ = true;
+}
+
+uint32_t ImuSlaveApp::localToMasterTimeUs(uint32_t localUs) {
+  double slope = 1.0;
+  double intercept = 0.0;
+  if (!loadClockModel(slope, intercept)) {
+    return localUs;
+  }
+  return static_cast<uint32_t>(slope * static_cast<double>(localUs) + intercept);
+}
+
+void ImuSlaveApp::sendSyncDiag() {
+  uint8_t masterMac[6] = {0};
+  if (!loadMasterMac(masterMac)) {
+    return;
+  }
+
+  capture::SyncDiagPacket diag{};
+  portENTER_CRITICAL(&offsetMux_);
+  diag.source = config_.nodeSource;
+  diag.state = state_;
+  diag.beaconSeq = lastBeaconSeq_;
+  diag.offsetUs = syncOffsetUs_;
+  diag.driftPpm = syncDriftPpm_;
+  diag.residualUs = syncResidualUs_;
+  diag.beaconCount = syncPointCount_;
+  portEXIT_CRITICAL(&offsetMux_);
+
+  uint8_t packet[capture::SYNC_DIAG_WIRE_SIZE] = {};
+  capture::buildSyncDiagPacket(diag, packet);
+  esp_now_send(masterMac, packet, sizeof(packet));
 }
 
 // 处理 Master ACK，释放本地 ring 中已经被确认的 batch。
@@ -315,12 +483,6 @@ void ImuSlaveApp::wirelessTask() {
   uint32_t lastSlotIndex = UINT32_MAX;
 
   for (;;) {
-    int32_t offsetUs = 0;
-    if (!loadTimeSync(offsetUs)) {
-      vTaskDelay(pdMS_TO_TICKS(2));
-      continue;
-    }
-
     if (!loadMasterMac(masterMac)) {
       vTaskDelay(pdMS_TO_TICKS(2));
       continue;
@@ -337,8 +499,27 @@ void ImuSlaveApp::wirelessTask() {
       }
     }
 
+    const uint8_t state = currentState();
+    if ((state == capture::STATE_SYNC || state == capture::STATE_STREAM_PENDING) &&
+        static_cast<uint32_t>(millis() - lastSyncDiagMs_) >= SYNC_DIAG_INTERVAL_MS) {
+      sendSyncDiag();
+      lastSyncDiagMs_ = millis();
+    }
+
+    if (state == capture::STATE_STREAM_PENDING &&
+        static_cast<int32_t>(localToMasterTimeUs(micros()) - pendingStreamStartUs_) >= 0) {
+      state_ = capture::STATE_STREAM;
+      streamStarted_ = true;
+      sendStateAck(lastCommandSeq_, pendingStreamStartUs_);
+    }
+
+    if (currentState() != capture::STATE_STREAM || !streamStarted_) {
+      vTaskDelay(pdMS_TO_TICKS(2));
+      continue;
+    }
+
     const uint32_t nowUs = micros();
-    const uint32_t masterNowUs = static_cast<uint32_t>(static_cast<int64_t>(nowUs) + offsetUs);
+    const uint32_t masterNowUs = localToMasterTimeUs(nowUs);
     const uint32_t slotIndex = masterNowUs / SEND_SUPERFRAME_US;
     const uint32_t phaseUs = masterNowUs % SEND_SUPERFRAME_US;
     if (slotIndex == lastSlotIndex || phaseUs < config_.sendSlotOffsetUs || phaseUs >= config_.sendSlotOffsetUs + 5000) {
@@ -375,45 +556,34 @@ void ImuSlaveApp::sensorTask() {
 
   capture::ImuRawSample batchSamples[capture::IMU_BATCH_SIZE] = {};
   uint8_t batchCount = 0;
-  uint32_t lastMasterTimestampUs = 0;
-  bool hasLastMasterTimestamp = false;
+  bool wasStreaming = false;
 
   for (;;) {
+    if (currentState() != capture::STATE_STREAM || !streamStarted_) {
+      if (batchCount > 0) {
+        batchCount = 0;
+      }
+      wasStreaming = false;
+      vTaskDelay(pdMS_TO_TICKS(2));
+      nextSampleUs = micros();
+      continue;
+    }
+
+    if (!wasStreaming) {
+      nextSampleUs = micros();
+      batchCount = 0;
+      wasStreaming = true;
+    }
+
     while (static_cast<int32_t>(micros() - nextSampleUs) < 0) {
       taskYIELD();
     }
     nextSampleUs += SAMPLE_PERIOD_US;
 
     const uint32_t localTimeUs = micros();
-    int32_t offsetUs = 0;
-    if (!loadTimeSync(offsetUs)) {
-      noteDroppedSamples(static_cast<uint32_t>(batchCount) + 1U);
-      batchCount = 0;
-      hasLastMasterTimestamp = false;
-      continue;
-    }
 
     capture::ImuRawSample sample{};
-    const uint32_t estimatedMasterTimeUs = static_cast<uint32_t>(static_cast<int64_t>(localTimeUs) + offsetUs);
-
-    if (!hasLastMasterTimestamp) {
-      // 新同步段的第一个样本直接采用估计 Master 时间。
-      sample.timestampUs = estimatedMasterTimeUs;
-      hasLastMasterTimestamp = true;
-    } else {
-      // 后续样本优先按 1ms 周期推进，只允许小幅校正，避免时间戳被 Beacon 抖动拉出毛刺。
-      const uint32_t predictedNextUs = lastMasterTimestampUs + SAMPLE_PERIOD_US;
-      const int32_t correctionErrorUs = static_cast<int32_t>(estimatedMasterTimeUs - predictedNextUs);
-      if (correctionErrorUs > TIME_OFFSET_RELOCK_ERROR_US || correctionErrorUs < -TIME_OFFSET_RELOCK_ERROR_US) {
-        noteDroppedSamples(batchCount);
-        sample.timestampUs = estimatedMasterTimeUs;
-        batchCount = 0;
-      } else {
-        const int32_t boundedCorrectionUs =
-            correctionErrorUs > 200 ? 200 : (correctionErrorUs < -200 ? -200 : correctionErrorUs);
-        sample.timestampUs = predictedNextUs + boundedCorrectionUs;
-      }
-    }
+    sample.timestampUs = localToMasterTimeUs(localTimeUs);
 
     if (!readSensor(sample)) {
       noteDroppedSamples(static_cast<uint32_t>(batchCount) + 1U);
@@ -421,7 +591,6 @@ void ImuSlaveApp::sensorTask() {
       continue;
     }
 
-    lastMasterTimestampUs = sample.timestampUs;
     batchSamples[batchCount++] = sample;
 
     if (batchCount >= capture::IMU_BATCH_SIZE) {

@@ -26,12 +26,14 @@ void MasterApp::begin() {
   // slaveRxQueue_ 承接 ESP-NOW 回调；serialQueue_ 承接所有准备发给 PC 的样本。
   slaveRxQueue_ = xQueueCreate(128, sizeof(SlaveRxItem));
   serialQueue_ = xQueueCreate(2048, sizeof(capture::PcSample));
+  serialWriteMux_ = xSemaphoreCreateMutex();
   initEspNow();
 
   // 串口写、无线处理、ADS 采样分开跑，避免任一路 I/O 抖动拖慢其他链路。
   xTaskCreatePinnedToCore(serialTxTaskStatic, "serialTx", 4096, this, 6, nullptr, 0);
   xTaskCreatePinnedToCore(wirelessTaskStatic, "masterWireless", 4096, this, 4, nullptr, 0);
   xTaskCreatePinnedToCore(sensorTaskStatic, "masterSensor", 4096, this, 5, nullptr, 1);
+  xTaskCreatePinnedToCore(serialCommandTaskStatic, "serialCommand", 4096, this, 3, nullptr, 0);
 }
 
 // ADS1298 DRDY 中断的静态转发入口。
@@ -63,6 +65,10 @@ void MasterApp::sensorTaskStatic(void *arg) {
   static_cast<MasterApp *>(arg)->sensorTask();
 }
 
+void MasterApp::serialCommandTaskStatic(void *arg) {
+  static_cast<MasterApp *>(arg)->serialCommandTask();
+}
+
 // 在 ISR 中通知 sensorTask 有一帧 ADS1298 数据可读。
 void MasterApp::onAdsDrdyFromIsr() {
   // ISR 不读 SPI，只唤醒采样任务；SPI 读写留在普通任务上下文中完成。
@@ -78,7 +84,13 @@ void MasterApp::onAdsDrdyFromIsr() {
 // 把 ESP-NOW 收到的 IMU batch 原样拷贝进队列，留给 wirelessTask 解码。
 void MasterApp::onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
   // ESP-NOW 回调运行环境较敏感，这里只做长度检查和拷贝入队。
-  if (data == nullptr || len != static_cast<int>(capture::IMU_BATCH_WIRE_SIZE)) {
+  if (data == nullptr || len <= 0 || len > static_cast<int>(capture::IMU_BATCH_WIRE_SIZE)) {
+    return;
+  }
+  const uint8_t type = data[0];
+  if (type != capture::MSG_TYPE_IMU_BATCH &&
+      type != capture::MSG_TYPE_SYNC_DIAG &&
+      type != capture::MSG_TYPE_STATE_ACK) {
     return;
   }
 
@@ -86,7 +98,8 @@ void MasterApp::onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
   if (mac != nullptr) {
     memcpy(item.mac, mac, 6);
   }
-  memcpy(item.packet.bytes, data, capture::IMU_BATCH_WIRE_SIZE);
+  item.len = static_cast<uint8_t>(len);
+  memcpy(item.bytes, data, len);
 
   if (slaveRxQueue_ != nullptr) {
     if (xQueueSend(slaveRxQueue_, &item, 0) != pdTRUE) {
@@ -331,6 +344,9 @@ void MasterApp::writeSerialSample(uint8_t source,
 // 阻塞式写完整个 USB CDC 数据块，处理 Serial.write 短写。
 void MasterApp::writeSerialBytesAll(const uint8_t *data, size_t size) {
   // Serial.write 可能短写，循环补齐可避免 PC 端收到半个 batch。
+  if (serialWriteMux_ != nullptr) {
+    xSemaphoreTake(serialWriteMux_, portMAX_DELAY);
+  }
   size_t writtenTotal = 0;
   while (writtenTotal < size) {
     const size_t written = Serial.write(data + writtenTotal, size - writtenTotal);
@@ -341,11 +357,113 @@ void MasterApp::writeSerialBytesAll(const uint8_t *data, size_t size) {
     }
     writtenTotal += written;
   }
+  if (serialWriteMux_ != nullptr) {
+    xSemaphoreGive(serialWriteMux_);
+  }
 }
 
 // 生成一条 SOURCE_DIAG 诊断帧，供 PC 端显示链路状态。
 void MasterApp::writeDiagFrame(uint32_t timestampUs, int32_t forwardedPerSec, int32_t errorsPerSec, int32_t onlineSlaveCount) {
   writeSerialSample(capture::SOURCE_DIAG, timestampUs, 0, 0, 0, forwardedPerSec, errorsPerSec, onlineSlaveCount);
+}
+
+void MasterApp::writePcSyncDiag(const capture::SyncDiagPacket &diag) {
+  uint8_t txBuffer[capture::PC_SERIAL_MAX_PACKET_SIZE] = {};
+  const size_t txSize = capture::buildPcSyncDiagPacket(diag, pcEventSequence_++, txBuffer);
+  writeSerialBytesAll(txBuffer, txSize);
+}
+
+void MasterApp::writePcStateEvent(const capture::StateAckPacket &event) {
+  uint8_t txBuffer[capture::PC_SERIAL_MAX_PACKET_SIZE] = {};
+  const size_t txSize = capture::buildPcStateEventPacket(event, pcEventSequence_++, txBuffer);
+  writeSerialBytesAll(txBuffer, txSize);
+}
+
+uint8_t MasterApp::currentState() const {
+  return state_;
+}
+
+uint32_t MasterApp::beaconIntervalMs(uint8_t state) const {
+  if (state == capture::STATE_SYNC || state == capture::STATE_STREAM_PENDING) {
+    return 100;
+  }
+  if (state == capture::STATE_STREAM) {
+    return 1000;
+  }
+  return 2000;
+}
+
+void MasterApp::resetStreamingState() {
+  emgSampleSeq_ = 0;
+  for (size_t i = 0; i < MAX_TRACKED_SLAVES; ++i) {
+    slaveRxStates_[i] = {};
+  }
+  if (serialQueue_ != nullptr) {
+    xQueueReset(serialQueue_);
+  }
+}
+
+void MasterApp::broadcastCommand(uint8_t targetState, uint32_t effectiveMasterTimeUs) {
+  uint8_t packet[capture::COMMAND_WIRE_SIZE] = {};
+  capture::buildCommandPacket(++commandSeq_, targetState, effectiveMasterTimeUs, packet);
+  for (uint8_t i = 0; i < 6; ++i) {
+    esp_now_send(broadcastMac_, packet, sizeof(packet));
+    vTaskDelay(pdMS_TO_TICKS(8));
+  }
+}
+
+void MasterApp::transitionTo(uint8_t newState, uint32_t effectiveMasterTimeUs) {
+  if (newState == capture::STATE_IDLE || newState == capture::STATE_SYNC || newState == capture::STATE_STREAM_PENDING) {
+    resetStreamingState();
+  }
+  pendingStreamStartUs_ = effectiveMasterTimeUs;
+  state_ = newState;
+  broadcastCommand(newState, effectiveMasterTimeUs);
+
+  capture::StateAckPacket event{};
+  event.source = capture::SOURCE_EMG;
+  event.state = newState;
+  event.commandSeq = commandSeq_;
+  event.effectiveMasterTimeUs = effectiveMasterTimeUs;
+  writePcStateEvent(event);
+}
+
+void MasterApp::handlePcCommand(String raw) {
+  raw.trim();
+  raw.toUpperCase();
+  if (raw.length() == 0) {
+    return;
+  }
+  if (raw == "PING") {
+    capture::StateAckPacket event{};
+    event.source = capture::SOURCE_EMG;
+    event.state = currentState();
+    event.commandSeq = commandSeq_;
+    event.effectiveMasterTimeUs = pendingStreamStartUs_;
+    writePcStateEvent(event);
+    return;
+  }
+  if (raw == "START_SYNC") {
+    transitionTo(capture::STATE_SYNC, 0);
+    return;
+  }
+  if (raw == "START_STREAM") {
+    transitionTo(capture::STATE_STREAM_PENDING, micros() + 500000UL);
+    return;
+  }
+  if (raw == "STOP") {
+    transitionTo(capture::STATE_IDLE, 0);
+    return;
+  }
+}
+
+void MasterApp::broadcastBeacon(uint32_t nowUs) {
+  capture::BeaconPacket beacon{};
+  beacon.type = capture::MSG_TYPE_BEACON;
+  beacon.beaconSeq = beaconSeq_++;
+  beacon.state = currentState();
+  beacon.masterTimeUs = nowUs;
+  esp_now_send(broadcastMac_, reinterpret_cast<const uint8_t *>(&beacon), sizeof(beacon));
 }
 
 // 从 serialQueue_ 取样本并合批编码为 USB CDC 帧。
@@ -373,8 +491,6 @@ void MasterApp::serialTxTask() {
 
 // 处理 Beacon 广播、Slave batch 解码、ACK 回复和每秒诊断统计。
 void MasterApp::wirelessTask() {
-  // 无线任务每秒广播一次 Beacon，同时持续处理 Slave 数据和发送 ACK。
-  TickType_t lastWake = xTaskGetTickCount();
   SlaveRxItem rxItem{};
   capture::ImuDecodedSample decodedSamples[capture::IMU_BATCH_SIZE] = {};
   uint8_t decodedCount = 0;
@@ -394,22 +510,59 @@ void MasterApp::wirelessTask() {
   uint32_t lastRetransmitPackets = 0;
   uint32_t lastMissingPackets = 0;
   uint32_t lastAckSendFails = 0;
+  uint32_t lastBeaconMs = 0;
+  uint32_t lastDiagMs = millis();
 
   for (;;) {
-    capture::BeaconPacket beacon = {capture::MSG_TYPE_BEACON, micros()};
-    esp_now_send(broadcastMac_, reinterpret_cast<const uint8_t *>(&beacon), sizeof(beacon));
+    const uint32_t nowMs = millis();
+    const uint8_t state = currentState();
+    if (static_cast<uint32_t>(nowMs - lastBeaconMs) >= beaconIntervalMs(state)) {
+      broadcastBeacon(micros());
+      lastBeaconMs = nowMs;
+    }
 
-    const TickType_t waitTicks = pdMS_TO_TICKS(1000);
-    const TickType_t deadline = lastWake + waitTicks;
+    if (state == capture::STATE_STREAM_PENDING &&
+        static_cast<int32_t>(micros() - pendingStreamStartUs_) >= 0) {
+      resetStreamingState();
+      state_ = capture::STATE_STREAM;
+      capture::StateAckPacket event{};
+      event.source = capture::SOURCE_EMG;
+      event.state = capture::STATE_STREAM;
+      event.commandSeq = commandSeq_;
+      event.effectiveMasterTimeUs = pendingStreamStartUs_;
+      writePcStateEvent(event);
+    }
 
-    for (;;) {
-      const TickType_t now = xTaskGetTickCount();
-      const TickType_t remaining = (deadline > now) ? (deadline - now) : 0;
-      if (xQueueReceive(slaveRxQueue_, &rxItem, remaining) != pdTRUE) {
-        break;
+    while (xQueueReceive(slaveRxQueue_, &rxItem, 0) == pdTRUE) {
+      if (rxItem.len == 0) {
+        continue;
       }
 
-      const capture::DecodeStatus status = capture::decodeImuBatchPacket(rxItem.packet,
+      if (rxItem.bytes[0] == capture::MSG_TYPE_STATE_ACK) {
+        capture::StateAckPacket event{};
+        if (capture::decodeStateAckPacket(rxItem.bytes, rxItem.len, event)) {
+          writePcStateEvent(event);
+          trackSlave(rxItem.mac, event.source, micros(), 0);
+        }
+        continue;
+      }
+
+      if (rxItem.bytes[0] == capture::MSG_TYPE_SYNC_DIAG) {
+        capture::SyncDiagPacket diag{};
+        if (capture::decodeSyncDiagPacket(rxItem.bytes, rxItem.len, diag)) {
+          writePcSyncDiag(diag);
+          trackSlave(rxItem.mac, diag.source, micros(), 0);
+        }
+        continue;
+      }
+
+      if (rxItem.len != capture::IMU_BATCH_WIRE_SIZE || currentState() != capture::STATE_STREAM) {
+        continue;
+      }
+
+      capture::ImuBatchWirePacket wirePacket{};
+      memcpy(wirePacket.bytes, rxItem.bytes, capture::IMU_BATCH_WIRE_SIZE);
+      const capture::DecodeStatus status = capture::decodeImuBatchPacket(wirePacket,
                                                                          decodedSamples,
                                                                          decodedCount,
                                                                          decodedSource,
@@ -453,35 +606,38 @@ void MasterApp::wirelessTask() {
       slaveForwardedSamples_ += decodedCount;
     }
 
-    const uint32_t nowUs = micros();
-    const int32_t onlineSlaves = countOnlineSlaves(nowUs);
-    const int32_t forwardedDelta = static_cast<int32_t>(slaveForwardedSamples_ - lastForwardedSamples);
-    const int32_t errorDelta = static_cast<int32_t>((slaveDecodeFails_ - lastDecodeFails) +
-                                                    (slaveCrcFails_ - lastCrcFails) +
-                                                    (slaveQueueDrops_ - lastQueueDrops) +
-                                                    (serialQueueDrops_ - lastSerialQueueDrops) +
-                                                    (serialWriteShorts_ - lastSerialWriteShorts) +
-                                                    (slaveRegistryDrops_ - lastRegistryDrops) +
-                                                    (slaveDuplicatePackets_ - lastDuplicatePackets) +
-                                                    (slaveRetransmitPackets_ - lastRetransmitPackets) +
-                                                    (slaveMissingPackets_ - lastMissingPackets) +
-                                                    (ackSendFails_ - lastAckSendFails));
+    if (static_cast<uint32_t>(nowMs - lastDiagMs) >= 1000) {
+      const uint32_t nowUs = micros();
+      const int32_t onlineSlaves = countOnlineSlaves(nowUs);
+      const int32_t forwardedDelta = static_cast<int32_t>(slaveForwardedSamples_ - lastForwardedSamples);
+      const int32_t errorDelta = static_cast<int32_t>((slaveDecodeFails_ - lastDecodeFails) +
+                                                      (slaveCrcFails_ - lastCrcFails) +
+                                                      (slaveQueueDrops_ - lastQueueDrops) +
+                                                      (serialQueueDrops_ - lastSerialQueueDrops) +
+                                                      (serialWriteShorts_ - lastSerialWriteShorts) +
+                                                      (slaveRegistryDrops_ - lastRegistryDrops) +
+                                                      (slaveDuplicatePackets_ - lastDuplicatePackets) +
+                                                      (slaveRetransmitPackets_ - lastRetransmitPackets) +
+                                                      (slaveMissingPackets_ - lastMissingPackets) +
+                                                      (ackSendFails_ - lastAckSendFails));
 
-    writeDiagFrame(nowUs, forwardedDelta, errorDelta, onlineSlaves);
+      writeDiagFrame(nowUs, forwardedDelta, errorDelta, onlineSlaves);
 
-    lastForwardedSamples = slaveForwardedSamples_;
-    lastDecodeFails = slaveDecodeFails_;
-    lastCrcFails = slaveCrcFails_;
-    lastQueueDrops = slaveQueueDrops_;
-    lastSerialQueueDrops = serialQueueDrops_;
-    lastSerialWriteShorts = serialWriteShorts_;
-    lastRegistryDrops = slaveRegistryDrops_;
-    lastDuplicatePackets = slaveDuplicatePackets_;
-    lastRetransmitPackets = slaveRetransmitPackets_;
-    lastMissingPackets = slaveMissingPackets_;
-    lastAckSendFails = ackSendFails_;
+      lastForwardedSamples = slaveForwardedSamples_;
+      lastDecodeFails = slaveDecodeFails_;
+      lastCrcFails = slaveCrcFails_;
+      lastQueueDrops = slaveQueueDrops_;
+      lastSerialQueueDrops = serialQueueDrops_;
+      lastSerialWriteShorts = serialWriteShorts_;
+      lastRegistryDrops = slaveRegistryDrops_;
+      lastDuplicatePackets = slaveDuplicatePackets_;
+      lastRetransmitPackets = slaveRetransmitPackets_;
+      lastMissingPackets = slaveMissingPackets_;
+      lastAckSendFails = ackSendFails_;
+      lastDiagMs = nowMs;
+    }
 
-    vTaskDelayUntil(&lastWake, waitTicks);
+    vTaskDelay(pdMS_TO_TICKS(2));
   }
 }
 
@@ -498,8 +654,29 @@ void MasterApp::sensorTask() {
     int32_t ch7 = 0;
     int32_t ch8 = 0;
 
-    if (ads_.readChannels(ch6, ch7, ch8)) {
+    if (currentState() == capture::STATE_STREAM && ads_.readChannels(ch6, ch7, ch8)) {
       writeSerialSample(capture::SOURCE_EMG, timestampUs, emgSampleSeq_++, 0, 0, ch6, ch7, ch8);
     }
+  }
+}
+
+void MasterApp::serialCommandTask() {
+  String line;
+  line.reserve(48);
+  for (;;) {
+    while (Serial.available() > 0) {
+      const char ch = static_cast<char>(Serial.read());
+      if (ch == '\n' || ch == '\r') {
+        if (line.length() > 0) {
+          handlePcCommand(line);
+          line = "";
+        }
+      } else if (line.length() < 47) {
+        line += ch;
+      } else {
+        line = "";
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }

@@ -45,14 +45,18 @@ class ImuSlaveApp {
     capture::ImuBatchWirePacket packet;
   };
 
+  struct SyncPoint {
+    uint32_t localUs;
+    uint32_t masterUs;
+  };
+
   static constexpr size_t BATCH_RING_CAPACITY = 256;
   static constexpr uint32_t SAMPLE_PERIOD_US = 1000;
   static constexpr uint32_t SEND_SUPERFRAME_US = 20000;
   static constexpr uint8_t MAX_SENDS_PER_SLOT = 3;
   static constexpr uint32_t RETRANSMIT_INTERVAL_US = 40000;
-  static constexpr int32_t TIME_OFFSET_SMALL_ERROR_US = 50000;
-  static constexpr int32_t TIME_OFFSET_RELOCK_ERROR_US = 500000;
-  static constexpr uint8_t TIME_OFFSET_RELOCK_CONFIRMATIONS = 3;
+  static constexpr size_t SYNC_WINDOW_CAPACITY = 64;
+  static constexpr uint32_t SYNC_DIAG_INTERVAL_MS = 200;
 
   // ESP-NOW/FreeRTOS C 风格回调转发到当前 ImuSlaveApp。
   static void onEspNowSentStatic(const uint8_t *mac, esp_now_send_status_t status);
@@ -72,14 +76,23 @@ class ImuSlaveApp {
   // 时间同步、ACK 和 ring buffer 管理。
   // 初始化 ESP-NOW 和发送功率。
   bool initEspNow();
-  // 读取当前时间同步偏移。
-  bool loadTimeSync(int32_t &offsetUs);
+  bool loadClockModel(double &slope, double &intercept);
   // 读取 Master MAC 地址。
   bool loadMasterMac(uint8_t outMac[6]);
   // 处理 Master Beacon。
   void handleBeacon(const uint8_t *mac, const uint8_t *data, int len);
+  void handleCommandPacket(const uint8_t *data, int len);
   // 处理 Master ACK。
   void handleAckPacket(const uint8_t *data, int len);
+  void applyState(uint8_t newState, uint16_t commandSeq, uint32_t effectiveMasterTimeUs);
+  void sendStateAck(uint16_t commandSeq, uint32_t effectiveMasterTimeUs);
+  void resetRingLocked();
+  void resetSyncFitLocked();
+  void recordBeaconLocked(uint32_t localRecvUs, uint32_t masterTimeUs, uint16_t beaconSeq);
+  void updateClockFitLocked();
+  void sendSyncDiag();
+  uint32_t localToMasterTimeUs(uint32_t localUs);
+  uint8_t currentState() const;
   // 推进最早未确认 batch 指针。
   void advanceOldestUnackedLocked();
   // 记录本地丢样并标记 link fault。
@@ -98,9 +111,21 @@ class ImuSlaveApp {
   // offsetMux_ 保护时间同步状态；ringMux_ 保护 batch ring 和样本序号。
   portMUX_TYPE offsetMux_ = portMUX_INITIALIZER_UNLOCKED;
   portMUX_TYPE ringMux_ = portMUX_INITIALIZER_UNLOCKED;
-  int32_t timeOffsetUs_ = 0;
-  bool hasTimeOffset_ = false;
-  uint8_t largeOffsetErrorCount_ = 0;
+  volatile uint8_t state_ = capture::STATE_IDLE;
+  uint16_t lastCommandSeq_ = 0;
+  uint32_t pendingStreamStartUs_ = 0;
+  double clockSlope_ = 1.0;
+  double clockIntercept_ = 0.0;
+  int32_t syncOffsetUs_ = 0;
+  int32_t syncDriftPpm_ = 0;
+  int32_t syncResidualUs_ = 0;
+  bool clockModelValid_ = false;
+  bool streamStarted_ = false;
+  SyncPoint syncPoints_[SYNC_WINDOW_CAPACITY] = {};
+  uint8_t syncPointCount_ = 0;
+  uint8_t syncPointHead_ = 0;
+  uint16_t lastBeaconSeq_ = 0;
+  uint32_t lastSyncDiagMs_ = 0;
   uint8_t masterMac_[6] = {0};
   bool hasMasterMac_ = false;
   volatile bool lastSendOk_ = false;
