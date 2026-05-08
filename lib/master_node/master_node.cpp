@@ -301,17 +301,36 @@ void MasterApp::markBatchReceived(SlaveRxState &state,
 }
 
 // 按当前接收窗口状态构造 ACK 并单播回 Slave。
-void MasterApp::sendAck(const SlaveRxState &state) {
+bool MasterApp::sendAck(SlaveRxState &state, uint32_t nowUs) {
   // ACK 单播回原 MAC；如果 peer 未登记，先补登记再发送。
+  state.lastAckSentUs = nowUs;
   if (!ensureEspNowPeer(state.mac)) {
     ++ackSendFails_;
-    return;
+    return false;
   }
 
   uint8_t ack[capture::IMU_ACK_WIRE_SIZE] = {};
-  capture::buildAckPacket(state.source, state.ackBaseSeq, state.ackSampleSeq, state.recvBitmap, micros(), ack);
+  capture::buildAckPacket(state.source, state.ackBaseSeq, state.ackSampleSeq, state.recvBitmap, nowUs, ack);
   if (esp_now_send(state.mac, ack, sizeof(ack)) != ESP_OK) {
     ++ackSendFails_;
+    return false;
+  }
+  state.ackPending = false;
+  return true;
+}
+
+// 把同一 Slave 短时间内产生的多个 ACK 合并成一次，避免 ESP-NOW 发送队列被 ACK 风暴打满。
+void MasterApp::sendPendingAcks(uint32_t nowUs) {
+  for (size_t i = 0; i < MAX_TRACKED_SLAVES; ++i) {
+    SlaveRxState &state = slaveRxStates_[i];
+    if (!state.used || !state.ackPending) {
+      continue;
+    }
+    if (state.lastAckSentUs != 0 &&
+        static_cast<uint32_t>(nowUs - state.lastAckSentUs) < ACK_MIN_INTERVAL_US) {
+      continue;
+    }
+    sendAck(state, nowUs);
   }
 }
 
@@ -600,7 +619,7 @@ void MasterApp::wirelessTask() {
 
       bool duplicate = false;
       markBatchReceived(*rxState, decodedBatchSeq, decodedSampleStartSeq, decodedFlags, duplicate);
-      sendAck(*rxState);
+      rxState->ackPending = true;
 
       trackSlave(rxItem.mac, decodedSource, nowUs, duplicate ? 0 : decodedCount);
       if (duplicate) {
@@ -620,6 +639,8 @@ void MasterApp::wirelessTask() {
       }
       slaveForwardedSamples_ += decodedCount;
     }
+
+    sendPendingAcks(micros());
 
     if (static_cast<uint32_t>(nowMs - lastDiagMs) >= 1000) {
       const uint32_t nowUs = micros();

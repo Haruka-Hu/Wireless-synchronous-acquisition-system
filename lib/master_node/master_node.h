@@ -53,6 +53,8 @@ class MasterApp {
     uint16_t ackBaseSeq;
     uint32_t ackSampleSeq;
     uint32_t recvBitmap;
+    bool ackPending;
+    uint32_t lastAckSentUs;
     uint32_t duplicatePackets;
     uint32_t retransmitPackets;
     uint32_t missingPackets;
@@ -60,6 +62,7 @@ class MasterApp {
 
   static constexpr size_t MAX_TRACKED_SLAVES = 16;
   static constexpr uint32_t SLAVE_OFFLINE_TIMEOUT_US = 3000000;
+  static constexpr uint32_t ACK_MIN_INTERVAL_US = 5000;
 
   // Arduino/ESP-NOW/FreeRTOS 需要 C 风格回调，用静态函数转发到当前 MasterApp 实例。
   static void onAdsDrdyStatic();
@@ -97,7 +100,9 @@ class MasterApp {
   // 标记 batch 已收到，并判断是否重复。
   void markBatchReceived(SlaveRxState &state, uint16_t batchSeq, uint32_t sampleStartSeq, uint8_t flags, bool &outDuplicate);
   // 发送当前接收窗口对应的 ACK。
-  void sendAck(const SlaveRxState &state);
+  bool sendAck(SlaveRxState &state, uint32_t nowUs);
+  // 合并并限速发送所有 Slave 的待发 ACK。
+  void sendPendingAcks(uint32_t nowUs);
 
   // 串口输出统一入口。所有来源最终都先进入 serialQueue_，再由 serialTxTask 合批写出。
   void writeSerialSample(uint8_t source,
