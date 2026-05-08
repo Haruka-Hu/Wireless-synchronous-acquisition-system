@@ -111,7 +111,13 @@ class MasterApp {
   // 将指定字节全部写入 USB CDC。
   void writeSerialBytesAll(const uint8_t *data, size_t size);
   // 写入一条诊断帧。
-  void writeDiagFrame(uint32_t timestampUs, int32_t forwardedPerSec, int32_t errorsPerSec, int32_t onlineSlaveCount);
+  void writeDiagFrame(uint32_t timestampUs,
+                      int32_t forwardedPerSec,
+                      int32_t hardErrorsPerSec,
+                      int32_t onlineSlaveCount,
+                      uint32_t linkEventsPerSec,
+                      uint16_t queueDropsPerSec,
+                      uint8_t ackFailsPerSec);
   void writePcSyncDiag(const capture::SyncDiagPacket &diag);
   void writePcStateEvent(const capture::StateAckPacket &event);
   void handlePcCommand(String raw);

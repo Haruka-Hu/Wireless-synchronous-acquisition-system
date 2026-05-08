@@ -24,14 +24,14 @@ void MasterApp::begin() {
 
   ads_.begin(onAdsDrdyStatic);
   // slaveRxQueue_ 承接 ESP-NOW 回调；serialQueue_ 承接所有准备发给 PC 的样本。
-  slaveRxQueue_ = xQueueCreate(128, sizeof(SlaveRxItem));
+  slaveRxQueue_ = xQueueCreate(512, sizeof(SlaveRxItem));
   serialQueue_ = xQueueCreate(2048, sizeof(capture::PcSample));
   serialWriteMux_ = xSemaphoreCreateMutex();
   initEspNow();
 
   // 串口写、无线处理、ADS 采样分开跑，避免任一路 I/O 抖动拖慢其他链路。
-  xTaskCreatePinnedToCore(serialTxTaskStatic, "serialTx", 4096, this, 6, nullptr, 0);
-  xTaskCreatePinnedToCore(wirelessTaskStatic, "masterWireless", 4096, this, 4, nullptr, 0);
+  xTaskCreatePinnedToCore(wirelessTaskStatic, "masterWireless", 4096, this, 7, nullptr, 0);
+  xTaskCreatePinnedToCore(serialTxTaskStatic, "serialTx", 4096, this, 4, nullptr, 0);
   xTaskCreatePinnedToCore(sensorTaskStatic, "masterSensor", 4096, this, 5, nullptr, 1);
   xTaskCreatePinnedToCore(serialCommandTaskStatic, "serialCommand", 4096, this, 3, nullptr, 0);
 }
@@ -363,8 +363,23 @@ void MasterApp::writeSerialBytesAll(const uint8_t *data, size_t size) {
 }
 
 // 生成一条 SOURCE_DIAG 诊断帧，供 PC 端显示链路状态。
-void MasterApp::writeDiagFrame(uint32_t timestampUs, int32_t forwardedPerSec, int32_t errorsPerSec, int32_t onlineSlaveCount) {
-  writeSerialSample(capture::SOURCE_DIAG, timestampUs, 0, 0, 0, forwardedPerSec, errorsPerSec, onlineSlaveCount);
+void MasterApp::writeDiagFrame(uint32_t timestampUs,
+                               int32_t forwardedPerSec,
+                               int32_t hardErrorsPerSec,
+                               int32_t onlineSlaveCount,
+                               uint32_t linkEventsPerSec,
+                               uint16_t queueDropsPerSec,
+                               uint8_t ackFailsPerSec) {
+  // SOURCE_DIAG 复用 PcSample 的额外字段：
+  // sampleSeq=无线重传/重复/缺口事件，batchSeq=队列丢弃，flags=ACK 发送失败。
+  writeSerialSample(capture::SOURCE_DIAG,
+                    timestampUs,
+                    linkEventsPerSec,
+                    queueDropsPerSec,
+                    ackFailsPerSec,
+                    forwardedPerSec,
+                    hardErrorsPerSec,
+                    onlineSlaveCount);
 }
 
 void MasterApp::writePcSyncDiag(const capture::SyncDiagPacket &diag) {
@@ -610,18 +625,26 @@ void MasterApp::wirelessTask() {
       const uint32_t nowUs = micros();
       const int32_t onlineSlaves = countOnlineSlaves(nowUs);
       const int32_t forwardedDelta = static_cast<int32_t>(slaveForwardedSamples_ - lastForwardedSamples);
-      const int32_t errorDelta = static_cast<int32_t>((slaveDecodeFails_ - lastDecodeFails) +
-                                                      (slaveCrcFails_ - lastCrcFails) +
-                                                      (slaveQueueDrops_ - lastQueueDrops) +
-                                                      (serialQueueDrops_ - lastSerialQueueDrops) +
-                                                      (serialWriteShorts_ - lastSerialWriteShorts) +
-                                                      (slaveRegistryDrops_ - lastRegistryDrops) +
-                                                      (slaveDuplicatePackets_ - lastDuplicatePackets) +
-                                                      (slaveRetransmitPackets_ - lastRetransmitPackets) +
-                                                      (slaveMissingPackets_ - lastMissingPackets) +
-                                                      (ackSendFails_ - lastAckSendFails));
+      const uint32_t queueDropDelta = (slaveQueueDrops_ - lastQueueDrops) +
+                                      (serialQueueDrops_ - lastSerialQueueDrops);
+      const uint32_t ackFailDelta = ackSendFails_ - lastAckSendFails;
+      const uint32_t linkEventDelta = (slaveDuplicatePackets_ - lastDuplicatePackets) +
+                                      (slaveRetransmitPackets_ - lastRetransmitPackets) +
+                                      (slaveMissingPackets_ - lastMissingPackets);
+      const int32_t hardErrorDelta = static_cast<int32_t>((slaveDecodeFails_ - lastDecodeFails) +
+                                                          (slaveCrcFails_ - lastCrcFails) +
+                                                          queueDropDelta +
+                                                          (serialWriteShorts_ - lastSerialWriteShorts) +
+                                                          (slaveRegistryDrops_ - lastRegistryDrops) +
+                                                          ackFailDelta);
 
-      writeDiagFrame(nowUs, forwardedDelta, errorDelta, onlineSlaves);
+      writeDiagFrame(nowUs,
+                     forwardedDelta,
+                     hardErrorDelta,
+                     onlineSlaves,
+                     linkEventDelta,
+                     static_cast<uint16_t>(min(queueDropDelta, static_cast<uint32_t>(UINT16_MAX))),
+                     static_cast<uint8_t>(min(ackFailDelta, static_cast<uint32_t>(UINT8_MAX))));
 
       lastForwardedSamples = slaveForwardedSamples_;
       lastDecodeFails = slaveDecodeFails_;

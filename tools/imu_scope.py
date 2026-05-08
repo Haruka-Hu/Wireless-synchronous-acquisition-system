@@ -278,6 +278,9 @@ class AcquisitionModel:
         self.diag_forwarded_per_sec = 0
         self.diag_errors_per_sec = 0
         self.diag_online_slave_count = 0
+        self.diag_link_events_per_sec = 0
+        self.diag_queue_drops_per_sec = 0
+        self.diag_ack_fails_per_sec = 0
         self.system_state = 0
         self.state_events: deque[StateEvent] = deque(maxlen=200)
         self.sync_diag = {
@@ -386,12 +389,23 @@ class AcquisitionModel:
                     ]
                 )
 
-    def update_diag(self, forwarded_per_sec: int, errors_per_sec: int, online_slave_count: int) -> None:
+    def update_diag(
+        self,
+        forwarded_per_sec: int,
+        errors_per_sec: int,
+        online_slave_count: int,
+        link_events_per_sec: int = 0,
+        queue_drops_per_sec: int = 0,
+        ack_fails_per_sec: int = 0,
+    ) -> None:
         """更新 Master 发来的每秒链路诊断信息。"""
         with self.lock:
             self.diag_forwarded_per_sec = forwarded_per_sec
             self.diag_errors_per_sec = errors_per_sec
             self.diag_online_slave_count = online_slave_count
+            self.diag_link_events_per_sec = link_events_per_sec
+            self.diag_queue_drops_per_sec = queue_drops_per_sec
+            self.diag_ack_fails_per_sec = ack_fails_per_sec
 
     def update_sync_diag(
         self,
@@ -483,13 +497,16 @@ class AcquisitionModel:
                 for source_id, source in self.sources.items()
             }
 
-    def diag_snapshot(self) -> tuple[int, int, int, ParserStats]:
+    def diag_snapshot(self) -> tuple[int, int, int, int, int, int, ParserStats]:
         """返回诊断统计快照，避免 UI 直接读取共享状态。"""
         with self.lock:
             return (
                 self.diag_forwarded_per_sec,
                 self.diag_errors_per_sec,
                 self.diag_online_slave_count,
+                self.diag_link_events_per_sec,
+                self.diag_queue_drops_per_sec,
+                self.diag_ack_fails_per_sec,
                 ParserStats(
                     crc_fails=self.parser_stats.crc_fails,
                     bad_headers=self.parser_stats.bad_headers,
@@ -777,7 +794,14 @@ class SerialReader(threading.Thread):
                             continue
 
                         if source_id == SOURCE_DIAG:
-                            self.model.update_diag(x, y, z)
+                            self.model.update_diag(
+                                x,
+                                y,
+                                z,
+                                link_events_per_sec=sample_seq,
+                                queue_drops_per_sec=batch_seq,
+                                ack_fails_per_sec=rx_flags,
+                            )
                             continue
 
                         self.note_timestamp(source_id, timestamp_us)
@@ -1086,7 +1110,15 @@ class MainWindow(QMainWindow):
             current_counts[source_id] = count
         self._update_source_rates(current_counts, now)
 
-        diag_forwarded, diag_errors, diag_online, parser_stats = self.model.diag_snapshot()
+        (
+            diag_forwarded,
+            diag_errors,
+            diag_online,
+            diag_link_events,
+            diag_queue_drops,
+            diag_ack_fails,
+            parser_stats,
+        ) = self.model.diag_snapshot()
         system_state, sync_diag, state_events = self.model.sync_snapshot()
         emg_count = self.last_counts[SOURCE_EMG] if self.last_counts[SOURCE_EMG] >= 0 else 0
         gyro_count = self.last_counts[SOURCE_GYRO] if self.last_counts[SOURCE_GYRO] >= 0 else 0
@@ -1118,7 +1150,8 @@ class MainWindow(QMainWindow):
         self.link_status_label.setText(
             f"{slave1_text} | {slave2_text} | "
             f"Gyro {gyro_count} 点 | Accel {accel_count} 点 | "
-            f"slave fwd {diag_forwarded}/s | err {diag_errors}/s | master online {diag_online} | "
+            f"slave fwd {diag_forwarded}/s | err {diag_errors}/s | link evt {diag_link_events}/s | "
+            f"qdrop {diag_queue_drops}/s | ackfail {diag_ack_fails}/s | master online {diag_online} | "
             f"crc {parser_stats.crc_fails} | bad hdr {parser_stats.bad_headers} | "
             f"bad src {parser_stats.bad_sources} | bad cnt {parser_stats.bad_counts} | "
             f"ts rej {parser_stats.bad_timestamps} | resync {parser_stats.resync_bytes}B"
