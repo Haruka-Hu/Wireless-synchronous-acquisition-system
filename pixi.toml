@@ -1,0 +1,35 @@
+[workspace]
+name = "espnow-sync-host"
+version = "0.1.0"
+description = "Host tools for ESP32-S3 ESP-NOW synchronized IMU capture"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64", "win-64"]
+
+[dependencies]
+python = ">=3.11,<3.13"
+pyserial = ">=3.5,<4"
+numpy = ">=1.26,<3"
+scipy = ">=1.13,<2"
+matplotlib = ">=3.8,<4"
+pyqtgraph = ">=0.13.7,<0.14"
+pyside6 = ">=6.7,<7"
+pyopengl = ">=3.1.7,<4"
+platformio = ">=6.1,<7"
+
+[pypi-dependencies]
+bleak = ">=0.22,<1"
+
+[tasks]
+host = "python tools/imu_scope.py"
+host-help = "python tools/imu_scope.py --help"
+host-list-ports = "python tools/imu_scope.py --list-ports"
+delay = "python tools/analyze_imu_delay.py"
+build-master = "platformio run -e master"
+build-slave-01 = "platformio run -e slave-01"
+build-slave-02 = "platformio run -e slave-02"
+build-motor = "platformio run -e motor"
+upload-master = "platformio run -e master -t upload"
+upload-slave-01 = "platformio run -e slave-01 -t upload"
+upload-slave-02 = "platformio run -e slave-02 -t upload"
+upload-motor = "platformio run -e motor -t upload"
+motor-host = "python tools/motor_controller.py"

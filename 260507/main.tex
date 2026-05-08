@@ -1,0 +1,401 @@
+%!TEX program = xelatex
+\documentclass[aspectratio=169,fontset=none]{ctexbeamer}
+\setCJKmainfont[
+  Path=/System/Library/Fonts/,
+  UprightFont={STHeiti Light.ttc},
+  BoldFont={STHeiti Medium.ttc}
+]{STHeiti Light.ttc}
+\setCJKsansfont[
+  Path=/System/Library/Fonts/,
+  UprightFont={STHeiti Light.ttc},
+  BoldFont={STHeiti Medium.ttc}
+]{STHeiti Light.ttc}
+\setCJKmonofont[
+  Path=/System/Library/Fonts/Supplemental/
+]{Songti.ttc}
+
+% 引用科大专属主题包
+\usepackage[bluetheme]{ustcbeamer}
+\input{ustctheme.tex}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{tikz}
+\usetikzlibrary{positioning,fit,arrows.meta,shapes.geometric}
+
+% ---------------------------------------------------
+% 封面信息配置
+% ---------------------------------------------------
+\title[无线腱反射采集系统]{
+    无线腱反射诱发与多传感器同步采集系统
+}
+\subtitle{组会汇报}
+\author[胡彦卓]{报告人：胡彦卓}
+\institute[USTC]{
+    微电子学院，神经肌肉控制实验室
+}
+\date{2026年5月7日}
+
+\begin{document}
+
+% ---------------------------------------------------
+\maketitleframe
+
+% ---------------------------------------------------
+\begin{frame}{汇报大纲}
+    \tableofcontents
+\end{frame}
+
+% ---------------------------------------------------
+\AtBeginSection[]{
+\setbeamertemplate{footline}[footlineoff]
+  \begin{frame}
+    \frametitle{大纲}
+    \tableofcontents[currentsection,subsectionstyle=show/show/hide]
+  \end{frame}
+\setbeamertemplate{footline}[footlineon]
+}
+
+% ===================================================
+\section{系统目标与总体架构}
+
+\begin{frame}{系统目标：同步记录腱反射过程中的关键事件}
+  \begin{columns}
+    \begin{column}{0.52\textwidth}
+      \begin{block}{实验对象}
+        \begin{itemize}
+          \item 膝跳反射：叩击髌腱后，小腿产生快速摆动。
+          \item 目标是把叩击、肌电响应和小腿运动放到统一时间轴上。
+        \end{itemize}
+      \end{block}
+      \begin{block}{需要同步采集的信号}
+        \begin{itemize}
+          \item 肌电：反映反射诱发后的神经肌肉响应。
+          \item 小腿角速度：刻画膝跳反射时小腿摆动过程。
+          \item 锤体加速度：捕捉叩击时刻与叩击波形。
+        \end{itemize}
+      \end{block}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+      \centering
+      \begin{tikzpicture}[
+        scale=0.76,
+        transform shape,
+        node distance=0.36cm,
+        sensor/.style={draw, rounded corners=2pt, align=center, minimum width=3.5cm, minimum height=0.72cm, fill=white},
+        event/.style={draw, rounded corners=2pt, align=center, minimum width=3.9cm, minimum height=0.82cm, fill=blue!5},
+        arrow/.style={-{Stealth[length=2.2mm]}, thick}
+      ]
+        \node[event] (tap) {叩击髌腱\\锤体加速度};
+        \node[event, below=of tap] (emg) {诱发肌电\\ADS1298};
+        \node[event, below=of emg] (motion) {小腿摆动\\角速度};
+        \node[sensor, right=0.75cm of emg] (axis) {统一时间轴\\反射潜伏期与运动响应};
+        \draw[arrow] (tap.east) -- (axis.west);
+        \draw[arrow] (emg.east) -- (axis.west);
+        \draw[arrow] (motion.east) -- (axis.west);
+      \end{tikzpicture}
+      \vspace{0.22cm}
+
+      \begin{block}{核心要求}
+        多节点、无线化、时间同步、可联调。
+      \end{block}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+\begin{frame}{总体架构：一主两从的同步采集链路}
+  \centering
+  \vspace{0.08cm}
+  \begin{tikzpicture}[
+    scale=0.88,
+    transform shape,
+    box/.style={draw, rounded corners=2pt, align=center, minimum width=3.0cm, minimum height=0.86cm, fill=white},
+    master/.style={draw, rounded corners=2pt, align=center, minimum width=3.45cm, minimum height=1.05cm, fill=blue!7},
+    pc/.style={draw, rounded corners=2pt, align=center, minimum width=3.15cm, minimum height=0.96cm, fill=green!7},
+    espnow/.style={-{Stealth[length=2.2mm]}, thick, teal!75!black},
+    beacon/.style={-{Stealth[length=2.2mm]}, thick, dashed, orange!85!black},
+    usb/.style={-{Stealth[length=2.2mm]}, thick, blue!75!black},
+    tag/.style={font=\scriptsize, fill=white, inner sep=1.2pt}
+  ]
+    \node[box] (slave1) at (-3.5,1.10) {从机 1\\MPU6500 角速度\\小腿摆动};
+    \node[box] (slave2) at (-3.5,-1.10) {从机 2\\MPU6500 加速度\\叩击锤};
+    \node[master] (master) at (0.85,0) {主机 Master\\ADS1298 肌电采集\\时间基准与数据汇聚};
+    \node[pc] (pc) at (5.0,0) {上位机\\实时显示\\CSV 保存};
+
+    \draw[espnow] (slave1.east) -- (master.west);
+    \draw[espnow] (slave2.east) -- (master.west);
+    \draw[beacon, shorten >=2pt] (master.165) to[out=165, in=0] (slave1.0);
+    \draw[beacon, shorten >=2pt] (master.195) to[out=195, in=0] (slave2.0);
+    \draw[usb] (master.east) -- (pc.west);
+
+    \fill[teal!75!black] (-3.38,-2.48) rectangle (-3.20,-2.36);
+    \node[tag, anchor=west] at (-3.10,-2.42) {ESP-NOW 批量包};
+    \fill[orange!85!black] (0.08,-2.48) rectangle (0.26,-2.36);
+    \node[tag, anchor=west] at (0.36,-2.42) {Beacon：Master $\rightarrow$ Slave};
+    \fill[blue!75!black] (4.08,-2.48) rectangle (4.26,-2.36);
+    \node[tag, anchor=west] at (4.36,-2.42) {USB CDC};
+  \end{tikzpicture}
+
+  \vspace{0.12cm}
+  \begin{block}{数据组织方式}
+    \begin{itemize}
+      \item Master 以自身时间为全局时间基准，Slave 收到 Beacon 后将本地采样时间换算到 Master 时间轴。
+      \item Master 将本地肌电、从机 IMU 与诊断信息统一封装后发给上位机。
+    \end{itemize}
+  \end{block}
+\end{frame}
+
+\begin{frame}{节点分工}
+  \vspace{0.08cm}
+  \begin{table}
+    \centering
+    \scriptsize
+    \begin{tabular}{p{0.13\textwidth}p{0.18\textwidth}p{0.13\textwidth}p{0.42\textwidth}}
+      \toprule
+      节点 & 传感器/执行器 & 安装位置 & 主要作用 \\
+      \midrule
+      Master & ADS1298 & 肌电电极侧 & 采集诱发肌电，广播时间基准，汇聚数据 \\
+      Slave-01 & MPU6500 陀螺仪 & 小腿 & 采集膝跳反射时小腿角速度 \\
+      Slave-02 & MPU6500 加速度计 & 叩击锤 & 捕捉叩击时刻和叩击波形 \\
+      Motor & 电机 + 驱动模块 & 叩击执行机构 & 后续通过蓝牙控制叩击动作 \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+
+  \vspace{0.22cm}
+  \begin{columns}
+    \begin{column}{0.50\textwidth}
+      \begin{block}{采集链路}
+        Master 与两个 Slave 构成同步采集系统，数据最终由 Master 输出到上位机。
+      \end{block}
+    \end{column}
+    \begin{column}{0.50\textwidth}
+      \begin{block}{控制链路}
+        Motor 节点作为独立蓝牙控制对象，后续与采集链路做触发和时序联调。
+      \end{block}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ===================================================
+\section{同步采集方案}
+
+\begin{frame}{时间同步与数据流}
+  \begin{columns}
+    \begin{column}{0.48\textwidth}
+      \begin{block}{同步思路}
+        \begin{itemize}
+          \item Master 周期广播带时间戳的 Beacon。
+          \item Slave 根据 Beacon 估算主从时间偏移。
+          \item Slave 每个采样点都写入换算后的 Master 时间戳。
+          \item 上位机按统一时间戳对齐肌电、角速度和加速度。
+        \end{itemize}
+      \end{block}
+    \end{column}
+    \begin{column}{0.52\textwidth}
+      \centering
+      \begin{tikzpicture}[
+        x=0.92cm,y=0.92cm,
+        scale=0.92,
+        transform shape,
+        line/.style={thick},
+        arrow/.style={-{Stealth[length=2.1mm]}, thick},
+        label/.style={font=\scriptsize},
+        tag/.style={font=\tiny, fill=white, inner sep=1pt}
+      ]
+        \draw[line] (0,2.4) -- (5.4,2.4);
+        \draw[line] (0,1.4) -- (5.4,1.4);
+        \draw[line] (0,0.4) -- (5.4,0.4);
+        \node[label, left] at (0,2.4) {Master};
+        \node[label, left] at (0,1.4) {Slave};
+        \node[label, left] at (0,0.4) {PC};
+
+        \foreach \x in {0.6,1.6,2.6,3.6,4.6}{
+          \draw[blue, thick] (\x,2.28) -- (\x,2.52);
+        }
+        \foreach \x in {0.9,1.9,2.9,3.9,4.9}{
+          \draw[teal!80!black, thick] (\x,1.28) -- (\x,1.52);
+        }
+        \draw[arrow, dashed] (1.05,2.28) -- (1.05,1.52);
+        \draw[arrow, dashed] (3.55,2.28) -- (3.55,1.52);
+        \draw[arrow] (2.05,1.52) .. controls (2.28,1.95) and (2.62,2.02) .. (2.95,2.28);
+        \draw[arrow] (4.05,1.52) .. controls (4.28,1.92) and (4.60,1.98) .. (4.95,2.28);
+        \draw[arrow] (5.25,2.28) -- (5.25,0.52);
+        \node[tag, anchor=west] at (0.55,-0.18) {虚线：Beacon};
+        \node[tag, anchor=west] at (2.05,-0.18) {弧线：IMU batch};
+        \node[tag, anchor=west] at (3.95,-0.18) {竖线：CDC batch};
+      \end{tikzpicture}
+    \end{column}
+  \end{columns}
+
+  \vspace{0.16cm}
+  \begin{block}{关键点}
+    采样、无线通信和串口输出分任务运行，并用 CRC 对 ESP-NOW 与 USB CDC 数据帧做校验。
+  \end{block}
+\end{frame}
+
+\begin{frame}{上位机视角：多源信号进入同一数据表}
+  \begin{columns}
+    \begin{column}{0.48\textwidth}
+      \begin{block}{统一输出}
+        \begin{itemize}
+          \item Master 将各节点样本打包为 USB CDC 批量帧。
+          \item 上位机解析帧头、类型、样本数、节点来源和 CRC。
+          \item 数据保存为 CSV，便于后续延迟、波形和幅值分析。
+        \end{itemize}
+      \end{block}
+    \end{column}
+    \begin{column}{0.52\textwidth}
+      \begin{table}
+        \centering
+        \small
+        \scriptsize
+        \begin{tabular}{p{0.18\linewidth}p{0.24\linewidth}p{0.38\linewidth}}
+          \toprule
+          source & 信号 & 用途 \\
+          \midrule
+          Master & EMG & 判断反射诱发肌电响应 \\
+          Slave-01 & Gyro $x/y/z$ & 分析小腿摆动起始和速度变化 \\
+          Slave-02 & Accel $x/y/z$ & 定位叩击瞬间和叩击强度 \\
+          Diag & 状态信息 & 检查丢包、CRC、同步状态 \\
+          \bottomrule
+        \end{tabular}
+      \end{table}
+      \vspace{0.1cm}
+      \begin{block}{分析目标}
+        从锤体加速度峰值出发，比较肌电响应潜伏期与小腿运动延迟。
+      \end{block}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ===================================================
+\section{当前进展}
+
+\begin{frame}{当前进展：主从机同步采集已完成}
+  \begin{columns}
+    \begin{column}{0.50\textwidth}
+      \begin{block}{已经完成}
+        \begin{itemize}
+          \item 完成 Master、Slave-01、Slave-02 三类采集固件。
+          \item 完成 Master 对两个 Slave 的时间同步和数据汇聚。
+          \item 完成 ESP-NOW 批量传输与 USB CDC 批量输出。
+          \item 完成上位机实时接收、显示和 CSV 保存流程。
+        \end{itemize}
+      \end{block}
+    \end{column}
+    \begin{column}{0.50\textwidth}
+      \begin{block}{目前可以验证}
+        \begin{itemize}
+          \item 肌电、角速度、加速度可以进入同一采集流程。
+          \item Slave 数据带有换算后的 Master 时间戳。
+          \item 上位机可用于观察同步波形和导出实验数据。
+        \end{itemize}
+      \end{block}
+      \begin{block}{阶段结论}
+        采集链路已经具备后续整机联调的基础。
+      \end{block}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+\begin{frame}{当前系统状态}
+  \centering
+  \begin{tikzpicture}[
+    stage/.style={draw, rounded corners=2pt, align=center, minimum width=3.05cm, minimum height=0.88cm, fill=white},
+    done/.style={draw, rounded corners=2pt, align=center, minimum width=3.05cm, minimum height=0.88cm, fill=green!10},
+    todo/.style={draw, rounded corners=2pt, align=center, minimum width=3.05cm, minimum height=0.88cm, fill=orange!10},
+    arrow/.style={-{Stealth[length=2.2mm]}, thick}
+  ]
+    \node[done] (emg) {主机肌电采集\\已接入};
+    \node[done, right=0.42cm of emg] (imu) {双从机 IMU\\已同步采集};
+    \node[done, right=0.42cm of imu] (host) {上位机接收\\已打通};
+    \node[todo, right=0.42cm of host] (motor) {蓝牙叩击控制\\待联调};
+    \draw[arrow] (emg) -- (imu);
+    \draw[arrow] (imu) -- (host);
+    \draw[arrow] (host) -- (motor);
+  \end{tikzpicture}
+
+  \vspace{0.35cm}
+  \begin{columns}
+    \begin{column}{0.50\textwidth}
+      \begin{block}{采集侧}
+        重点问题已经从“能否同步采到多源数据”转向“整机实验时序是否稳定”。
+      \end{block}
+    \end{column}
+    \begin{column}{0.50\textwidth}
+      \begin{block}{执行侧}
+        蓝牙控制叩击将作为下一阶段引入，减少手动叩击的不确定性。
+      \end{block}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ===================================================
+\section{下一步计划}
+
+\begin{frame}{下一步计划：蓝牙控制叩击}
+  \begin{columns}
+    \begin{column}{0.52\textwidth}
+      \begin{block}{目标}
+        \begin{itemize}
+          \item 使用蓝牙控制叩击执行节点，替代人工手动叩击。
+          \item 保持叩击动作和采集链路相互独立，降低系统耦合。
+          \item 通过锤体加速度反推真实叩击时刻，保证分析以实测事件为准。
+        \end{itemize}
+      \end{block}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+      \centering
+      \begin{tikzpicture}[
+        node distance=0.42cm,
+        box/.style={draw, rounded corners=2pt, align=center, minimum width=3.7cm, minimum height=0.82cm, fill=white},
+        arrow/.style={-{Stealth[length=2.2mm]}, thick}
+      ]
+        \node[box] (pc) {上位机\\蓝牙控制指令};
+        \node[box, below=of pc] (motor) {Motor 节点\\PWM 控制};
+        \node[box, below=of motor] (hammer) {叩击机构\\产生可控叩击};
+        \node[box, below=of hammer] (acc) {锤体加速度\\记录实际叩击波形};
+        \draw[arrow] (pc) -- node[right, font=\scriptsize]{BLE} (motor);
+        \draw[arrow] (motor) -- (hammer);
+        \draw[arrow] (hammer) -- (acc);
+      \end{tikzpicture}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+\begin{frame}{下一步计划：整机联调测试}
+  \begin{columns}
+    \begin{column}{0.50\textwidth}
+      \begin{block}{联调内容}
+        \begin{itemize}
+          \item 蓝牙叩击控制与采集上位机流程联调。
+          \item 验证叩击加速度、肌电响应、小腿角速度之间的时序关系。
+          \item 观察连续测试下的丢包、同步漂移和波形稳定性。
+        \end{itemize}
+      \end{block}
+    \end{column}
+    \begin{column}{0.50\textwidth}
+      \begin{block}{预期输出}
+        \begin{itemize}
+          \item 得到包含叩击、肌电、运动响应的完整实验数据。
+          \item 形成初步的反射潜伏期与运动响应分析流程。
+          \item 根据联调结果继续优化固定方式、采样参数和控制节拍。
+        \end{itemize}
+      \end{block}
+    \end{column}
+  \end{columns}
+
+  \vspace{0.22cm}
+  \begin{block}{近期里程碑}
+    完成“蓝牙触发叩击 -- 加速度捕捉叩击 -- 肌电与角速度同步记录”的闭环验证。
+  \end{block}
+\end{frame}
+
+\begin{frame}{}
+  \vspace{0.30\textheight}
+  \centering
+  \Huge 谢谢！
+\end{frame}
+
+\end{document}
