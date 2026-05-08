@@ -124,12 +124,21 @@ ImuBatchWirePacket makeImuBatchPacket(uint8_t source,
 // diff=0 表示已经落在连续确认区，diff=1..32 对应 bitmap 的 bit0..bit31。
 bool ackCoversBatchSeq(uint16_t seq, uint16_t ackBaseSeq, uint32_t recvBitmap) {
   const uint16_t diff = static_cast<uint16_t>(seq - ackBaseSeq);
+  
   if (diff == 0) {
-    return true;
+    return true; // 刚好是当前的连续确认基准
   }
+  
+  // ✅ 修复核心：如果 seq 落后于 ackBaseSeq（即 diff 落在下半区），
+  // 说明这个包在此之前就已经被 Master 确认接收了，应该毫不犹豫地释放槽位！
+  if (diff > 32768U) {
+    return true; 
+  }
+  
   if (diff >= 1 && diff <= 32) {
-    return (recvBitmap & (1UL << (diff - 1))) != 0;
+    return (recvBitmap & (1UL << (diff - 1))) != 0; // 在未来窗口内，检查位图
   }
+  
   return false;
 }
 

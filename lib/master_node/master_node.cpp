@@ -304,6 +304,9 @@ void MasterApp::markBatchReceived(SlaveRxState &state,
 bool MasterApp::sendAck(SlaveRxState &state, uint32_t nowUs) {
   // ACK 单播回原 MAC；如果 peer 未登记，先补登记再发送。
   state.lastAckSentUs = nowUs;
+  // ✅ 修复关键：无论底层 Wi-Fi 发送是否成功，先清除 pending 标志。
+  // 把重传的责任交还给 Slave 的 40ms 超时机制，防止 Master TX 队列死锁。
+  state.ackPending = false;
   if (!ensureEspNowPeer(state.mac)) {
     ++ackSendFails_;
     return false;
