@@ -11,7 +11,7 @@ ImuSlaveApp g_app({
     2000,
     ImuSlaveApp::SensorMode::Gyro,
     {{10, 11, 13, 12}, 0x18, 0x10},
-    80,
+    240,
     2000000,
     32,
 });

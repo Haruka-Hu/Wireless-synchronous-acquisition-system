@@ -11,7 +11,7 @@ ImuSlaveApp g_app({
     10000,
     ImuSlaveApp::SensorMode::Accel,
     {{10, 11, 13, 12}, 0x10, 0x18},
-    80,
+    240,
     2000000,
     32,
 });
