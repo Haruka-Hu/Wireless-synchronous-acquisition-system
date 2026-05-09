@@ -35,3 +35,6 @@ venv/
 # Legacy local prototype backup; current firmware lives in src/ and lib/*_driver|*_node.
 lib/main copy.cpp
 data/
+.vscode
+.claude
+
