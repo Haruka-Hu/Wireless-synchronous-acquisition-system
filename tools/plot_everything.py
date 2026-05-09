@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import queue
 import struct
 import sys
 import threading
@@ -53,7 +54,7 @@ PC_MSG_SYNC_DIAG = 0x31
 PC_MSG_STATE_EVENT = 0x32
 PC_BATCH_HEADER_SIZE = 5
 PC_SAMPLE_SIZE = 24
-PC_MAX_BATCH_SAMPLES = 48
+PC_MAX_BATCH_SAMPLES = 16
 PC_BATCH_MIN_SIZE = PC_BATCH_HEADER_SIZE + PC_SAMPLE_SIZE + 2
 PC_SAMPLE_STRUCT = struct.Struct("<BIIHBiii")
 PC_SYNC_DIAG_SIZE = 24
@@ -103,6 +104,9 @@ UINT32_WRAP = 2**32
 INT32_HALF_WRAP = 2**31
 STREAM_MIN_SIZE = PC_BATCH_MIN_SIZE
 MIN_FRAME_SIZE = 7
+RAW_QUEUE_MAX_CHUNKS = 256
+SERIAL_READ_SIZE = 8192
+MAX_RESEND_REQUESTS_PER_GAP = 64
 # CRC 已经证明帧边界有效；时间戳只用于发现断线/重同步后的时间轴跳变。
 TIMESTAMP_RELOCK_GAP_US = 250_000
 TIMESTAMP_RELOCK_BACKWARD_US = 2_000
@@ -170,6 +174,17 @@ def crc16_ccitt(data: bytes) -> int:
     for byte in data:
         crc = ((crc << 8) ^ _CRC16_TABLE[(crc >> 8) ^ byte]) & 0xFFFF
     return crc
+
+
+def missing_pc_frames(previous_sequence: int | None, current_sequence: int) -> int:
+    """返回 8-bit PC sample batch sequence 中间跳过的帧数。"""
+    if previous_sequence is None:
+        return 0
+    diff = (current_sequence - previous_sequence) & 0xFF
+    if diff <= 1:
+        return 0
+    return diff - 1
+
 
 def parse_args() -> argparse.Namespace:
     """解析 IMU/EMG 示波器的命令行参数。"""
@@ -245,8 +260,15 @@ class ParserStats:
     bad_headers: int = 0
     bad_sources: int = 0
     bad_counts: int = 0
+    last_bad_count: int = 0
+    pc_sequence_gaps: int = 0
+    pc_resend_requests: int = 0
+    pc_resend_recovered: int = 0
+    pc_duplicate_frames: int = 0
     bad_timestamps: int = 0
     resync_bytes: int = 0
+    host_queue_drops: int = 0
+    host_queue_drop_bytes: int = 0
     reader_errors: int = 0
     last_reader_error: str = ""
 
@@ -311,6 +333,10 @@ class AcquisitionModel:
         self.diag_link_events_per_sec = 0
         self.diag_queue_drops_per_sec = 0
         self.diag_ack_fails_per_sec = 0
+        self.diag_errors_total = 0
+        self.diag_link_events_total = 0
+        self.diag_queue_drops_total = 0
+        self.diag_ack_fails_total = 0
         self.system_state = 0
         self.state_events: deque[StateEvent] = deque(maxlen=200)
         self.sync_diag = {
@@ -376,46 +402,61 @@ class AcquisitionModel:
         z: int,
     ) -> None:
         """追加一条来自串口的样本到缓存，并在录制时写入 CSV。"""
+        self.append_samples([(source_id, timestamp_us, sample_seq, batch_seq, rx_flags, x, y, z, time.time())])
+
+    def append_samples(
+        self,
+        samples: list[tuple[int, int, int, int, int, int, int, int, float]],
+    ) -> None:
+        """按 PC 帧批量追加样本，减少串口解析线程在锁和 CSV I/O 上的开销。"""
+        if not samples:
+            return
+
         with self.lock:
-            source = self.sources.get(source_id)
-            if source is None:
-                return
+            csv_rows: list[list[object]] = []
+            for source_id, timestamp_us, sample_seq, batch_seq, rx_flags, x, y, z, host_rx_time in samples:
+                source = self.sources.get(source_id)
+                if source is None:
+                    continue
 
-            if source_id == SOURCE_EMG:
-                display_x, display_y, display_z = self._filter_emg_locked(x, y, z)
-            else:
-                display_x, display_y, display_z = float(x), float(y), float(z)
+                if source_id == SOURCE_EMG:
+                    display_x, display_y, display_z = self._filter_emg_locked(x, y, z)
+                else:
+                    display_x, display_y, display_z = float(x), float(y), float(z)
 
-            source.timestamps_us.append(timestamp_us)
-            source.sample_seq.append(sample_seq)
-            source.batch_seq.append(batch_seq)
-            source.rx_flags.append(rx_flags)
-            source.x.append(x)
-            source.y.append(y)
-            source.z.append(z)
-            source.display_x.append(display_x)
-            source.display_y.append(display_y)
-            source.display_z.append(display_z)
-            source.last_host_rx_time = time.time()
-            source.received_count += 1
+                source.timestamps_us.append(timestamp_us)
+                source.sample_seq.append(sample_seq)
+                source.batch_seq.append(batch_seq)
+                source.rx_flags.append(rx_flags)
+                source.x.append(x)
+                source.y.append(y)
+                source.z.append(z)
+                source.display_x.append(display_x)
+                source.display_y.append(display_y)
+                source.display_z.append(display_z)
+                source.last_host_rx_time = host_rx_time
+                source.received_count += 1
 
-            if self.is_recording and self.csv_writer is not None:
-                vector_norm = float(np.sqrt(float(x) * float(x) + float(y) * float(y) + float(z) * float(z)))
-                self.csv_writer.writerow(
-                    [
-                        f"{time.time():.6f}",
-                        SOURCE_NAMES.get(source_id, f"Unknown({source_id})"),
-                        source_id,
-                        timestamp_us,
-                        sample_seq,
-                        batch_seq,
-                        rx_flags,
-                        x,
-                        y,
-                        z,
-                        f"{vector_norm:.3f}",
-                    ]
-                )
+                if self.is_recording and self.csv_writer is not None:
+                    vector_norm = float(np.sqrt(float(x) * float(x) + float(y) * float(y) + float(z) * float(z)))
+                    csv_rows.append(
+                        [
+                            f"{host_rx_time:.6f}",
+                            SOURCE_NAMES.get(source_id, f"Unknown({source_id})"),
+                            source_id,
+                            timestamp_us,
+                            sample_seq,
+                            batch_seq,
+                            rx_flags,
+                            x,
+                            y,
+                            z,
+                            f"{vector_norm:.3f}",
+                        ]
+                    )
+
+            if csv_rows and self.csv_writer is not None:
+                self.csv_writer.writerows(csv_rows)
 
     def update_diag(
         self,
@@ -434,6 +475,10 @@ class AcquisitionModel:
             self.diag_link_events_per_sec = link_events_per_sec
             self.diag_queue_drops_per_sec = queue_drops_per_sec
             self.diag_ack_fails_per_sec = ack_fails_per_sec
+            self.diag_errors_total += max(0, errors_per_sec)
+            self.diag_link_events_total += max(0, link_events_per_sec)
+            self.diag_queue_drops_total += max(0, queue_drops_per_sec)
+            self.diag_ack_fails_total += max(0, ack_fails_per_sec)
 
     def update_sync_diag(
         self,
@@ -524,7 +569,7 @@ class AcquisitionModel:
                 for source_id, source in self.sources.items()
             }
 
-    def diag_snapshot(self) -> tuple[int, int, int, int, int, int, ParserStats]:
+    def diag_snapshot(self) -> tuple[int, int, int, int, int, int, int, int, int, int, ParserStats]:
         """返回诊断统计快照，避免 UI 直接读取共享状态。"""
         with self.lock:
             return (
@@ -534,13 +579,24 @@ class AcquisitionModel:
                 self.diag_link_events_per_sec,
                 self.diag_queue_drops_per_sec,
                 self.diag_ack_fails_per_sec,
+                self.diag_errors_total,
+                self.diag_link_events_total,
+                self.diag_queue_drops_total,
+                self.diag_ack_fails_total,
                 ParserStats(
                     crc_fails=self.parser_stats.crc_fails,
                     bad_headers=self.parser_stats.bad_headers,
                     bad_sources=self.parser_stats.bad_sources,
                     bad_counts=self.parser_stats.bad_counts,
+                    last_bad_count=self.parser_stats.last_bad_count,
+                    pc_sequence_gaps=self.parser_stats.pc_sequence_gaps,
+                    pc_resend_requests=self.parser_stats.pc_resend_requests,
+                    pc_resend_recovered=self.parser_stats.pc_resend_recovered,
+                    pc_duplicate_frames=self.parser_stats.pc_duplicate_frames,
                     bad_timestamps=self.parser_stats.bad_timestamps,
                     resync_bytes=self.parser_stats.resync_bytes,
+                    host_queue_drops=self.parser_stats.host_queue_drops,
+                    host_queue_drop_bytes=self.parser_stats.host_queue_drop_bytes,
                     reader_errors=self.parser_stats.reader_errors,
                     last_reader_error=self.parser_stats.last_reader_error,
                 ),
@@ -567,9 +623,30 @@ class AcquisitionModel:
         with self.lock:
             self.parser_stats.bad_sources += 1
 
-    def note_bad_count(self) -> None:
+    def note_bad_count(self, count: int) -> None:
         with self.lock:
             self.parser_stats.bad_counts += 1
+            self.parser_stats.last_bad_count = count
+
+    def note_pc_sequence_gap(self, missing_frames: int) -> None:
+        if missing_frames <= 0:
+            return
+        with self.lock:
+            self.parser_stats.pc_sequence_gaps += missing_frames
+
+    def note_pc_resend_request(self, count: int = 1) -> None:
+        if count <= 0:
+            return
+        with self.lock:
+            self.parser_stats.pc_resend_requests += count
+
+    def note_pc_resend_recovered(self) -> None:
+        with self.lock:
+            self.parser_stats.pc_resend_recovered += 1
+
+    def note_pc_duplicate_frame(self) -> None:
+        with self.lock:
+            self.parser_stats.pc_duplicate_frames += 1
 
     def note_bad_timestamp(self) -> None:
         with self.lock:
@@ -580,6 +657,11 @@ class AcquisitionModel:
             return
         with self.lock:
             self.parser_stats.resync_bytes += count
+
+    def note_host_queue_drop(self, byte_count: int) -> None:
+        with self.lock:
+            self.parser_stats.host_queue_drops += 1
+            self.parser_stats.host_queue_drop_bytes += max(0, byte_count)
 
     def note_reader_error(self, exc: Exception) -> None:
         with self.lock:
@@ -656,6 +738,10 @@ class SerialReader(threading.Thread):
         self.serial_port: serial.Serial | None = None
         self.last_timestamp_us: dict[int, int] = {}
         self.write_lock = threading.Lock()
+        self.raw_queue: queue.Queue[bytes] = queue.Queue(maxsize=RAW_QUEUE_MAX_CHUNKS)
+        self.raw_reader_thread: threading.Thread | None = None
+        self.last_sample_frame_sequence: int | None = None
+        self.pending_resend_sequences: set[int] = set()
 
     def open(self) -> None:
         """打开串口并设置 DTR/RTS，准备接收 Master CDC 数据。"""
@@ -672,6 +758,27 @@ class SerialReader(threading.Thread):
         """请求串口读取线程退出。"""
         self.stop_event.set()
 
+    def _raw_reader_loop(self) -> None:
+        """只负责从 CDC 端口搬运原始字节，避免被解析、绘图和 CSV I/O 阻塞。"""
+        if self.serial_port is None:
+            return
+
+        while not self.stop_event.is_set():
+            try:
+                chunk = self.serial_port.read(SERIAL_READ_SIZE)
+                if not chunk:
+                    continue
+                try:
+                    self.raw_queue.put_nowait(chunk)
+                except queue.Full:
+                    self.model.note_host_queue_drop(len(chunk))
+            except serial.SerialException as exc:
+                self.model.note_reader_error(exc)
+                self.stop_event.set()
+                break
+            except Exception as exc:
+                self.model.note_reader_error(exc)
+
     def send_text_command(self, command: str) -> None:
         """向 Master 发送一条以换行结尾的文本控制命令。"""
         if self.serial_port is None or not self.serial_port.is_open:
@@ -680,6 +787,45 @@ class SerialReader(threading.Thread):
         with self.write_lock:
             self.serial_port.write(payload)
             self.serial_port.flush()
+
+    def request_resend(self, sequence: int) -> None:
+        """请求 Master 重发某个 PC sample batch sequence。"""
+        seq = sequence & 0xFF
+        if seq in self.pending_resend_sequences:
+            return
+        self.pending_resend_sequences.add(seq)
+        try:
+            self.send_text_command(f"RESEND {seq}")
+            self.model.note_pc_resend_request()
+        except Exception as exc:
+            self.model.note_reader_error(exc)
+
+    def classify_sample_frame_sequence(self, sequence: int) -> str:
+        """返回 current/recovered/duplicate，用于处理正常帧与乱序重发帧。"""
+        if self.last_sample_frame_sequence is None:
+            self.last_sample_frame_sequence = sequence
+            return "current"
+
+        diff = (sequence - self.last_sample_frame_sequence) & 0xFF
+        if diff == 0:
+            self.model.note_pc_duplicate_frame()
+            return "duplicate"
+        if diff < 128:
+            missing = diff - 1
+            if missing > 0:
+                self.model.note_pc_sequence_gap(missing)
+                for offset in range(1, min(missing, MAX_RESEND_REQUESTS_PER_GAP) + 1):
+                    self.request_resend((self.last_sample_frame_sequence + offset) & 0xFF)
+            self.last_sample_frame_sequence = sequence
+            return "current"
+
+        if sequence in self.pending_resend_sequences:
+            self.pending_resend_sequences.remove(sequence)
+            self.model.note_pc_resend_recovered()
+            return "recovered"
+
+        self.model.note_pc_duplicate_frame()
+        return "duplicate"
 
     def note_timestamp(self, source_id: int, timestamp_us: int) -> None:
         """检查到达顺序中的时间戳异常，并在必要时触发 EMG 重锁。"""
@@ -712,14 +858,16 @@ class SerialReader(threading.Thread):
         if self.serial_port is None:
             raise RuntimeError("串口尚未打开。")
 
+        self.raw_reader_thread = threading.Thread(target=self._raw_reader_loop, name="serialRawReader", daemon=True)
+        self.raw_reader_thread.start()
         raw_buffer = bytearray()
         while not self.stop_event.is_set():
             try:
-                chunk = self.serial_port.read(8192)
-                if chunk:
+                try:
+                    chunk = self.raw_queue.get(timeout=0.05)
                     raw_buffer += chunk
-                else:
-                    time.sleep(0.001)
+                except queue.Empty:
+                    continue
 
                 while len(raw_buffer) >= MIN_FRAME_SIZE:
                     idx = raw_buffer.find(FRAME_HEADER)
@@ -778,10 +926,11 @@ class SerialReader(threading.Thread):
 
                     sample_count = raw_buffer[3]
                     if sample_count == 0 or sample_count > PC_MAX_BATCH_SAMPLES:
-                        self.model.note_bad_count()
+                        self.model.note_bad_count(sample_count)
                         raw_buffer = raw_buffer[1:]
                         continue
 
+                    frame_sequence = raw_buffer[4]
                     packet_size = PC_BATCH_HEADER_SIZE + sample_count * PC_SAMPLE_SIZE + 2
                     if len(raw_buffer) < packet_size:
                         break
@@ -794,7 +943,14 @@ class SerialReader(threading.Thread):
                         raw_buffer = raw_buffer[1:]
                         continue
 
+                    sequence_status = self.classify_sample_frame_sequence(frame_sequence)
+                    if sequence_status == "duplicate":
+                        raw_buffer = raw_buffer[packet_size:]
+                        continue
+
                     payload_offset = PC_BATCH_HEADER_SIZE
+                    decoded_samples: list[tuple[int, int, int, int, int, int, int, int, float]] = []
+                    host_rx_time = time.time()
                     for _ in range(sample_count):
                         sample_bytes = frame[payload_offset : payload_offset + PC_SAMPLE_SIZE]
                         payload_offset += PC_SAMPLE_SIZE
@@ -819,12 +975,13 @@ class SerialReader(threading.Thread):
                             )
                             continue
 
-                        self.note_timestamp(source_id, timestamp_us)
-                        self.model.append_sample(source_id, timestamp_us, sample_seq, batch_seq, rx_flags, x, y, z)
+                        if sequence_status == "current":
+                            self.note_timestamp(source_id, timestamp_us)
+                        decoded_samples.append((source_id, timestamp_us, sample_seq, batch_seq, rx_flags, x, y, z, host_rx_time))
+
+                    self.model.append_samples(decoded_samples)
 
                     raw_buffer = raw_buffer[packet_size:]
-            except serial.SerialException:
-                break
             except Exception as exc:
                 self.model.note_reader_error(exc)
                 continue
@@ -1101,6 +1258,7 @@ class MainWindow(QMainWindow):
         try:
             warning_text = self._stream_sync_warning() if command == "START_STREAM" else ""
             self.reader.send_text_command(command)
+            self.reader.send_text_command("PING")
             if warning_text:
                 self.control_status_text = f"已发送命令: {command} <br><span style='color:#FFAB40;'>{warning_text}</span>"
             else:
@@ -1180,6 +1338,10 @@ class MainWindow(QMainWindow):
             diag_link_events,
             diag_queue_drops,
             diag_ack_fails,
+            diag_errors_total,
+            diag_link_events_total,
+            diag_queue_drops_total,
+            diag_ack_fails_total,
             parser_stats,
         ) = self.model.diag_snapshot()
         system_state, sync_diag, state_events = self.model.sync_snapshot()
@@ -1191,6 +1353,11 @@ class MainWindow(QMainWindow):
             f" &nbsp;|&nbsp; reader_err {parser_stats.reader_errors} ({parser_stats.last_reader_error})"
             if parser_stats.reader_errors
             else ""
+        )
+        host_queue_text = (
+            f" &nbsp;&nbsp; 主机队列丢: {parser_stats.host_queue_drops}次/{parser_stats.host_queue_drop_bytes}B"
+            if parser_stats.host_queue_drops
+            else " &nbsp;&nbsp; 主机队列丢: 0"
         )
         slave1_last_rx = status_snapshot.get(SOURCE_GYRO, (0, 0.0))[1]
         slave2_last_rx = status_snapshot.get(SOURCE_ACCEL, (0, 0.0))[1]
@@ -1235,9 +1402,13 @@ class MainWindow(QMainWindow):
         self.link_status_label.setText(
             f"<b>[连接状态]</b> {slave1_text} &nbsp;&nbsp; {slave2_text}<br>"
             f"<b>[缓冲队列]</b> Gyro: {gyro_count} &nbsp;&nbsp; Accel: {accel_count}<br>"
-            f"<b>[无线吞吐]</b> Master收到: {diag_forwarded}/s &nbsp;&nbsp; 错包(err): {diag_errors}/s &nbsp;&nbsp; 事件重发: {diag_link_events}/s<br>"
-            f"<b>[链路丢包]</b> Slave抛弃(qdrop): {diag_queue_drops}/s &nbsp;&nbsp; 确认失败(ackfail): {diag_ack_fails}/s &nbsp;&nbsp;<br>"
-            f"<b>[底层串流]</b> CRC错: {parser_stats.crc_fails} &nbsp;&nbsp; 帧头错: {parser_stats.bad_headers} &nbsp;&nbsp; 丢弃: {parser_stats.resync_bytes}B {reader_error_text}"
+            f"<b>[无线吞吐]</b> Master收到: {diag_forwarded}/s &nbsp;&nbsp; 错包(err): {diag_errors_total} &nbsp;&nbsp; 事件重发: {diag_link_events_total}<br>"
+            f"<b>[链路丢包]</b> Slave抛弃(qdrop): {diag_queue_drops_total} &nbsp;&nbsp; 确认失败(ackfail): {diag_ack_fails_total}<br>"
+            f"<b>[底层串流]</b> CRC错: {parser_stats.crc_fails} &nbsp;&nbsp; 帧头错: {parser_stats.bad_headers} "
+            f"&nbsp;&nbsp; count错: {parser_stats.bad_counts}({parser_stats.last_bad_count}) &nbsp;&nbsp; PC跳帧: {parser_stats.pc_sequence_gaps}<br>"
+            f"<b>[USB重发]</b> 请求: {parser_stats.pc_resend_requests} &nbsp;&nbsp; 恢复: {parser_stats.pc_resend_recovered} "
+            f"&nbsp;&nbsp; 重复/过期: {parser_stats.pc_duplicate_frames}<br>"
+            f"<b>[主机接收]</b> 丢弃: {parser_stats.resync_bytes}B{host_queue_text}{reader_error_text}"
         )
 
     def toggle_recording(self) -> None:

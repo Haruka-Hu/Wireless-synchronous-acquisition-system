@@ -57,9 +57,10 @@ constexpr uint8_t IMU_FLAG_RETRANSMIT = 0x01;
 constexpr uint8_t IMU_FLAG_TIME_SYNCED = 0x02;
 constexpr uint8_t IMU_FLAG_LINK_FAULT = 0x04;
 
-// PC 串口每帧最多合批 48 条样本。单样本 24 字节，包含 sample_seq/batch_seq/flags。
+// PC 串口每帧最多合批 16 条样本。单样本 24 字节，包含 sample_seq/batch_seq/flags。
+// 帧保持较小可降低单次 CRC 失败造成的样本损失，也减轻发送任务栈压力。
 constexpr size_t PC_SAMPLE_WIRE_SIZE = 24;
-constexpr uint8_t PC_SERIAL_MAX_SAMPLES = 48;
+constexpr uint8_t PC_SERIAL_MAX_SAMPLES = 16;
 constexpr size_t PC_SERIAL_HEADER_SIZE = 5;
 constexpr size_t PC_SERIAL_MAX_PACKET_SIZE = PC_SERIAL_HEADER_SIZE + PC_SERIAL_MAX_SAMPLES * PC_SAMPLE_WIRE_SIZE + 2;
 

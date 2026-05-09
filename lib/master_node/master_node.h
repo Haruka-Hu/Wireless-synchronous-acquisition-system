@@ -60,7 +60,21 @@ class MasterApp {
     uint32_t missingPackets;
   };
 
+  struct PcSerialFrameCacheEntry {
+    bool valid;
+    uint8_t sequence;
+    uint16_t size;
+    uint8_t bytes[capture::PC_SERIAL_MAX_PACKET_SIZE];
+  };
+
+  struct PcSerialTxFrame {
+    uint16_t size;
+    uint8_t bytes[capture::PC_SERIAL_MAX_PACKET_SIZE];
+  };
+
   static constexpr size_t MAX_TRACKED_SLAVES = 16;
+  static constexpr size_t PC_SERIAL_FRAME_QUEUE_SIZE = 16;
+  static constexpr size_t PC_SERIAL_RETX_CACHE_SIZE = 64;
   static constexpr uint32_t SLAVE_OFFLINE_TIMEOUT_US = 3000000;
   static constexpr uint32_t ACK_MIN_INTERVAL_US = 40000;
 
@@ -115,6 +129,10 @@ class MasterApp {
                          int32_t z);
   // 将指定字节全部写入 USB CDC。
   void writeSerialBytesAll(const uint8_t *data, size_t size);
+  void enqueuePcSerialFrame(const uint8_t *data, size_t size);
+  void cachePcSerialFrame(uint8_t sequence, const uint8_t *data, size_t size);
+  bool resendPcSerialFrame(uint8_t sequence);
+  void handlePcRetransmitCommand(const String &raw);
   // 写入一条诊断帧。
   void writeDiagFrame(uint32_t timestampUs,
                       int32_t forwardedPerSec,
@@ -138,11 +156,14 @@ class MasterApp {
   TaskHandle_t sensorTaskHandle_ = nullptr;
   QueueHandle_t slaveRxQueue_ = nullptr;
   QueueHandle_t serialQueue_ = nullptr;
+  QueueHandle_t serialFrameQueue_ = nullptr;
   SemaphoreHandle_t serialWriteMux_ = nullptr;
+  SemaphoreHandle_t pcSerialRetxMux_ = nullptr;
   uint8_t broadcastMac_[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
   // 下面这些计数器每秒汇总为 SOURCE_DIAG，方便 PC 端观察链路质量。
   uint32_t serialQueueDrops_ = 0;
+  uint32_t serialFrameQueueDrops_ = 0;
   uint32_t slaveQueueDrops_ = 0;
   uint32_t slaveDecodeFails_ = 0;
   uint32_t slaveCrcFails_ = 0;
@@ -163,4 +184,5 @@ class MasterApp {
 
   SlaveTracker slaveTrackers_[MAX_TRACKED_SLAVES] = {};
   SlaveRxState slaveRxStates_[MAX_TRACKED_SLAVES] = {};
+  PcSerialFrameCacheEntry pcSerialRetxCache_[PC_SERIAL_RETX_CACHE_SIZE] = {};
 };

@@ -7,6 +7,8 @@
 namespace {
 
 MasterApp *g_activeApp = nullptr;
+constexpr uint32_t TASK_STACK_DEFAULT = 4096;
+constexpr uint32_t TASK_STACK_SERIAL_TX = 8192;
 
 }  // namespace
 
@@ -28,14 +30,16 @@ void MasterApp::begin() {
   // slaveRxQueue_ 承接 ESP-NOW 回调；serialQueue_ 承接所有准备发给 PC 的样本。
   slaveRxQueue_ = xQueueCreate(512, sizeof(SlaveRxItem));
   serialQueue_ = xQueueCreate(4096, sizeof(capture::PcSample));
+  serialFrameQueue_ = xQueueCreate(PC_SERIAL_FRAME_QUEUE_SIZE, sizeof(PcSerialTxFrame));
   serialWriteMux_ = xSemaphoreCreateMutex();
+  pcSerialRetxMux_ = xSemaphoreCreateMutex();
   initEspNow();
 
   // 串口写、无线处理、ADS 采样分开跑，避免任一路 I/O 抖动拖慢其他链路。
-  xTaskCreatePinnedToCore(wirelessTaskStatic, "masterWireless", 4096, this, 7, nullptr, 0);
-  xTaskCreatePinnedToCore(serialTxTaskStatic, "serialTx", 4096, this, 6, nullptr, 0);
-  xTaskCreatePinnedToCore(sensorTaskStatic, "masterSensor", 4096, this, 5, nullptr, 1);
-  xTaskCreatePinnedToCore(serialCommandTaskStatic, "serialCommand", 4096, this, 3, nullptr, 0);
+  xTaskCreatePinnedToCore(wirelessTaskStatic, "masterWireless", TASK_STACK_DEFAULT, this, 7, nullptr, 0);
+  xTaskCreatePinnedToCore(serialTxTaskStatic, "serialTx", TASK_STACK_SERIAL_TX, this, 6, nullptr, 0);
+  xTaskCreatePinnedToCore(sensorTaskStatic, "masterSensor", TASK_STACK_DEFAULT, this, 5, nullptr, 1);
+  xTaskCreatePinnedToCore(serialCommandTaskStatic, "serialCommand", TASK_STACK_DEFAULT, this, 3, nullptr, 0);
 }
 
 // ADS1298 DRDY 中断的静态转发入口。
@@ -390,6 +394,63 @@ void MasterApp::writeSerialBytesAll(const uint8_t *data, size_t size) {
   }
 }
 
+void MasterApp::enqueuePcSerialFrame(const uint8_t *data, size_t size) {
+  if (data == nullptr || size == 0 || size > capture::PC_SERIAL_MAX_PACKET_SIZE) {
+    return;
+  }
+  if (serialFrameQueue_ == nullptr) {
+    ++serialFrameQueueDrops_;
+    return;
+  }
+
+  PcSerialTxFrame frame{};
+  frame.size = static_cast<uint16_t>(size);
+  memcpy(frame.bytes, data, size);
+  if (xQueueSend(serialFrameQueue_, &frame, 0) != pdTRUE) {
+    ++serialFrameQueueDrops_;
+  }
+}
+
+void MasterApp::cachePcSerialFrame(uint8_t sequence, const uint8_t *data, size_t size) {
+  if (data == nullptr || size == 0 || size > capture::PC_SERIAL_MAX_PACKET_SIZE) {
+    return;
+  }
+  if (pcSerialRetxMux_ != nullptr) {
+    xSemaphoreTake(pcSerialRetxMux_, portMAX_DELAY);
+  }
+  PcSerialFrameCacheEntry &entry = pcSerialRetxCache_[sequence % PC_SERIAL_RETX_CACHE_SIZE];
+  entry.valid = true;
+  entry.sequence = sequence;
+  entry.size = static_cast<uint16_t>(size);
+  memcpy(entry.bytes, data, size);
+  if (pcSerialRetxMux_ != nullptr) {
+    xSemaphoreGive(pcSerialRetxMux_);
+  }
+}
+
+bool MasterApp::resendPcSerialFrame(uint8_t sequence) {
+  uint8_t txBuffer[capture::PC_SERIAL_MAX_PACKET_SIZE] = {};
+  uint16_t txSize = 0;
+
+  if (pcSerialRetxMux_ != nullptr) {
+    xSemaphoreTake(pcSerialRetxMux_, portMAX_DELAY);
+  }
+  const PcSerialFrameCacheEntry &entry = pcSerialRetxCache_[sequence % PC_SERIAL_RETX_CACHE_SIZE];
+  if (entry.valid && entry.sequence == sequence && entry.size <= capture::PC_SERIAL_MAX_PACKET_SIZE) {
+    txSize = entry.size;
+    memcpy(txBuffer, entry.bytes, txSize);
+  }
+  if (pcSerialRetxMux_ != nullptr) {
+    xSemaphoreGive(pcSerialRetxMux_);
+  }
+
+  if (txSize == 0) {
+    return false;
+  }
+  enqueuePcSerialFrame(txBuffer, txSize);
+  return true;
+}
+
 // 生成一条 SOURCE_DIAG 诊断帧，供 PC 端显示链路状态。
 void MasterApp::writeDiagFrame(uint32_t timestampUs,
                                int32_t forwardedPerSec,
@@ -413,13 +474,13 @@ void MasterApp::writeDiagFrame(uint32_t timestampUs,
 void MasterApp::writePcSyncDiag(const capture::SyncDiagPacket &diag) {
   uint8_t txBuffer[capture::PC_SERIAL_MAX_PACKET_SIZE] = {};
   const size_t txSize = capture::buildPcSyncDiagPacket(diag, pcEventSequence_++, txBuffer);
-  writeSerialBytesAll(txBuffer, txSize);
+  enqueuePcSerialFrame(txBuffer, txSize);
 }
 
 void MasterApp::writePcStateEvent(const capture::StateAckPacket &event) {
   uint8_t txBuffer[capture::PC_SERIAL_MAX_PACKET_SIZE] = {};
   const size_t txSize = capture::buildPcStateEventPacket(event, pcEventSequence_++, txBuffer);
-  writeSerialBytesAll(txBuffer, txSize);
+  enqueuePcSerialFrame(txBuffer, txSize);
 }
 
 uint8_t MasterApp::currentState() const {
@@ -443,6 +504,9 @@ void MasterApp::resetStreamingState() {
   }
   if (serialQueue_ != nullptr) {
     xQueueReset(serialQueue_);
+  }
+  if (serialFrameQueue_ != nullptr) {
+    xQueueReset(serialFrameQueue_);
   }
 }
 
@@ -486,6 +550,10 @@ void MasterApp::handlePcCommand(String raw) {
     writePcStateEvent(event);
     return;
   }
+  if (raw.startsWith("RESEND") || raw.startsWith("NACK")) {
+    handlePcRetransmitCommand(raw);
+    return;
+  }
   if (raw == "START_SYNC") {
     transitionTo(capture::STATE_SYNC, 0);
     return;
@@ -497,6 +565,25 @@ void MasterApp::handlePcCommand(String raw) {
   if (raw == "STOP") {
     transitionTo(capture::STATE_IDLE, 0);
     return;
+  }
+}
+
+void MasterApp::handlePcRetransmitCommand(const String &raw) {
+  int index = 0;
+  while (index < raw.length()) {
+    while (index < raw.length() && !isDigit(raw[index])) {
+      ++index;
+    }
+    if (index >= raw.length()) {
+      break;
+    }
+
+    int value = 0;
+    while (index < raw.length() && isDigit(raw[index])) {
+      value = value * 10 + (raw[index] - '0');
+      ++index;
+    }
+    resendPcSerialFrame(static_cast<uint8_t>(value & 0xFF));
   }
 }
 
@@ -514,10 +601,17 @@ void MasterApp::serialTxTask() {
   // 小窗口合批发送，减少 USB CDC 包头开销，同时保持毫秒级刷新。
   capture::PcSample sample{};
   capture::PcSample batch[capture::PC_SERIAL_MAX_SAMPLES] = {};
+  PcSerialTxFrame frame{};
   uint8_t txBuffer[capture::PC_SERIAL_MAX_PACKET_SIZE] = {};
 
   for (;;) {
-    if (xQueueReceive(serialQueue_, &sample, portMAX_DELAY) == pdTRUE) {
+    if (serialFrameQueue_ != nullptr &&
+        xQueueReceive(serialFrameQueue_, &frame, pdMS_TO_TICKS(2)) == pdTRUE) {
+      writeSerialBytesAll(frame.bytes, frame.size);
+      continue;
+    }
+
+    if (xQueueReceive(serialQueue_, &sample, pdMS_TO_TICKS(2)) == pdTRUE) {
       uint8_t sampleCount = 0;
       batch[sampleCount++] = sample;
 
@@ -526,7 +620,9 @@ void MasterApp::serialTxTask() {
         batch[sampleCount++] = sample;
       }
 
-      const size_t txSize = capture::buildPcBatchPacket(batch, sampleCount, pcSerialSequence_++, txBuffer);
+      const uint8_t sequence = pcSerialSequence_++;
+      const size_t txSize = capture::buildPcBatchPacket(batch, sampleCount, sequence, txBuffer);
+      cachePcSerialFrame(sequence, txBuffer, txSize);
       writeSerialBytesAll(txBuffer, txSize);
     }
   }
@@ -547,6 +643,7 @@ void MasterApp::wirelessTask() {
   uint32_t lastCrcFails = 0;
   uint32_t lastQueueDrops = 0;
   uint32_t lastSerialQueueDrops = 0;
+  uint32_t lastSerialFrameQueueDrops = 0;
   uint32_t lastSerialWriteShorts = 0;
   uint32_t lastRegistryDrops = 0;
   uint32_t lastDuplicatePackets = 0;
@@ -656,7 +753,8 @@ void MasterApp::wirelessTask() {
       const int32_t onlineSlaves = countOnlineSlaves(nowUs);
       const int32_t forwardedDelta = static_cast<int32_t>(slaveForwardedSamples_ - lastForwardedSamples);
       const uint32_t queueDropDelta = (slaveQueueDrops_ - lastQueueDrops) +
-                                      (serialQueueDrops_ - lastSerialQueueDrops);
+                                      (serialQueueDrops_ - lastSerialQueueDrops) +
+                                      (serialFrameQueueDrops_ - lastSerialFrameQueueDrops);
       const uint32_t ackFailDelta = ackSendFails_ - lastAckSendFails;
       const uint32_t linkEventDelta = (slaveDuplicatePackets_ - lastDuplicatePackets) +
                                       (slaveRetransmitPackets_ - lastRetransmitPackets) +
@@ -681,6 +779,7 @@ void MasterApp::wirelessTask() {
       lastCrcFails = slaveCrcFails_;
       lastQueueDrops = slaveQueueDrops_;
       lastSerialQueueDrops = serialQueueDrops_;
+      lastSerialFrameQueueDrops = serialFrameQueueDrops_;
       lastSerialWriteShorts = serialWriteShorts_;
       lastRegistryDrops = slaveRegistryDrops_;
       lastDuplicatePackets = slaveDuplicatePackets_;

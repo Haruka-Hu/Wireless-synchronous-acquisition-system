@@ -52,7 +52,7 @@ PC_MSG_SYNC_DIAG = 0x31
 PC_MSG_STATE_EVENT = 0x32
 PC_BATCH_HEADER_SIZE = 5
 PC_SAMPLE_SIZE = 24
-PC_MAX_BATCH_SAMPLES = 48
+PC_MAX_BATCH_SAMPLES = 16
 PC_BATCH_MIN_SIZE = PC_BATCH_HEADER_SIZE + PC_SAMPLE_SIZE + 2
 PC_SAMPLE_STRUCT = struct.Struct("<BIIHBiii")
 PC_SYNC_DIAG_SIZE = 24
@@ -140,6 +140,16 @@ def crc16_ccitt(data: bytes) -> int:
     return crc
 
 
+def missing_pc_frames(previous_sequence: int | None, current_sequence: int) -> int:
+    """返回 8-bit PC sample batch sequence 中间跳过的帧数。"""
+    if previous_sequence is None:
+        return 0
+    diff = (current_sequence - previous_sequence) & 0xFF
+    if diff <= 1:
+        return 0
+    return diff - 1
+
+
 def parse_args() -> argparse.Namespace:
     """解析 IMU/EMG 示波器的命令行参数。"""
     parser = argparse.ArgumentParser(description="按当前 CDC 协议显示 EMG / Gyro / Accel 波形。")
@@ -214,6 +224,8 @@ class ParserStats:
     bad_headers: int = 0
     bad_sources: int = 0
     bad_counts: int = 0
+    last_bad_count: int = 0
+    pc_sequence_gaps: int = 0
     bad_timestamps: int = 0
     resync_bytes: int = 0
     reader_errors: int = 0
@@ -281,6 +293,10 @@ class AcquisitionModel:
         self.diag_link_events_per_sec = 0
         self.diag_queue_drops_per_sec = 0
         self.diag_ack_fails_per_sec = 0
+        self.diag_errors_total = 0
+        self.diag_link_events_total = 0
+        self.diag_queue_drops_total = 0
+        self.diag_ack_fails_total = 0
         self.system_state = 0
         self.state_events: deque[StateEvent] = deque(maxlen=200)
         self.sync_diag = {
@@ -406,6 +422,10 @@ class AcquisitionModel:
             self.diag_link_events_per_sec = link_events_per_sec
             self.diag_queue_drops_per_sec = queue_drops_per_sec
             self.diag_ack_fails_per_sec = ack_fails_per_sec
+            self.diag_errors_total += max(0, errors_per_sec)
+            self.diag_link_events_total += max(0, link_events_per_sec)
+            self.diag_queue_drops_total += max(0, queue_drops_per_sec)
+            self.diag_ack_fails_total += max(0, ack_fails_per_sec)
 
     def update_sync_diag(
         self,
@@ -497,7 +517,7 @@ class AcquisitionModel:
                 for source_id, source in self.sources.items()
             }
 
-    def diag_snapshot(self) -> tuple[int, int, int, int, int, int, ParserStats]:
+    def diag_snapshot(self) -> tuple[int, int, int, int, int, int, int, int, int, int, ParserStats]:
         """返回诊断统计快照，避免 UI 直接读取共享状态。"""
         with self.lock:
             return (
@@ -507,11 +527,17 @@ class AcquisitionModel:
                 self.diag_link_events_per_sec,
                 self.diag_queue_drops_per_sec,
                 self.diag_ack_fails_per_sec,
+                self.diag_errors_total,
+                self.diag_link_events_total,
+                self.diag_queue_drops_total,
+                self.diag_ack_fails_total,
                 ParserStats(
                     crc_fails=self.parser_stats.crc_fails,
                     bad_headers=self.parser_stats.bad_headers,
                     bad_sources=self.parser_stats.bad_sources,
                     bad_counts=self.parser_stats.bad_counts,
+                    last_bad_count=self.parser_stats.last_bad_count,
+                    pc_sequence_gaps=self.parser_stats.pc_sequence_gaps,
                     bad_timestamps=self.parser_stats.bad_timestamps,
                     resync_bytes=self.parser_stats.resync_bytes,
                     reader_errors=self.parser_stats.reader_errors,
@@ -543,10 +569,17 @@ class AcquisitionModel:
         with self.lock:
             self.parser_stats.bad_sources += 1
 
-    def note_bad_count(self) -> None:
+    def note_bad_count(self, count: int) -> None:
         """记录 batch 中样本数量字段异常。"""
         with self.lock:
             self.parser_stats.bad_counts += 1
+            self.parser_stats.last_bad_count = count
+
+    def note_pc_sequence_gap(self, missing_frames: int) -> None:
+        if missing_frames <= 0:
+            return
+        with self.lock:
+            self.parser_stats.pc_sequence_gaps += missing_frames
 
     def note_bad_timestamp(self) -> None:
         """记录时间戳顺序异常。"""
@@ -636,6 +669,7 @@ class SerialReader(threading.Thread):
         self.serial_port: serial.Serial | None = None
         self.last_timestamp_us: dict[int, int] = {}
         self.write_lock = threading.Lock()
+        self.last_sample_frame_sequence: int | None = None
 
     def open(self) -> None:
         """打开串口并设置 DTR/RTS，准备接收 Master CDC 数据。"""
@@ -762,10 +796,11 @@ class SerialReader(threading.Thread):
 
                     sample_count = raw_buffer[3]
                     if sample_count == 0 or sample_count > PC_MAX_BATCH_SAMPLES:
-                        self.model.note_bad_count()
+                        self.model.note_bad_count(sample_count)
                         raw_buffer = raw_buffer[1:]
                         continue
 
+                    frame_sequence = raw_buffer[4]
                     packet_size = PC_BATCH_HEADER_SIZE + sample_count * PC_SAMPLE_SIZE + 2
                     if len(raw_buffer) < packet_size:
                         break
@@ -777,6 +812,10 @@ class SerialReader(threading.Thread):
                         self.model.note_crc_fail()
                         raw_buffer = raw_buffer[1:]
                         continue
+
+                    if self.last_sample_frame_sequence is not None:
+                        self.model.note_pc_sequence_gap(missing_pc_frames(self.last_sample_frame_sequence, frame_sequence))
+                    self.last_sample_frame_sequence = frame_sequence
 
                     payload_offset = PC_BATCH_HEADER_SIZE
                     for _ in range(sample_count):
@@ -1117,6 +1156,10 @@ class MainWindow(QMainWindow):
             diag_link_events,
             diag_queue_drops,
             diag_ack_fails,
+            diag_errors_total,
+            diag_link_events_total,
+            diag_queue_drops_total,
+            diag_ack_fails_total,
             parser_stats,
         ) = self.model.diag_snapshot()
         system_state, sync_diag, state_events = self.model.sync_snapshot()
@@ -1150,10 +1193,11 @@ class MainWindow(QMainWindow):
         self.link_status_label.setText(
             f"{slave1_text} | {slave2_text} | "
             f"Gyro {gyro_count} 点 | Accel {accel_count} 点 | "
-            f"slave fwd {diag_forwarded}/s | err {diag_errors}/s | link evt {diag_link_events}/s | "
-            f"qdrop {diag_queue_drops}/s | ackfail {diag_ack_fails}/s | master online {diag_online} | "
+            f"slave fwd {diag_forwarded}/s | err {diag_errors_total} | link evt {diag_link_events_total} | "
+            f"qdrop {diag_queue_drops_total} | ackfail {diag_ack_fails_total} | master online {diag_online} | "
             f"crc {parser_stats.crc_fails} | bad hdr {parser_stats.bad_headers} | "
-            f"bad src {parser_stats.bad_sources} | bad cnt {parser_stats.bad_counts} | "
+            f"bad src {parser_stats.bad_sources} | bad cnt {parser_stats.bad_counts}({parser_stats.last_bad_count}) | "
+            f"pc gap {parser_stats.pc_sequence_gaps} | "
             f"ts rej {parser_stats.bad_timestamps} | resync {parser_stats.resync_bytes}B"
             f"{reader_error_text}"
         )
