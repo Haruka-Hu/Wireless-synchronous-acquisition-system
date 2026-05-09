@@ -107,6 +107,9 @@ bool ImuSlaveApp::initEspNow() {
     return false;
   }
 
+  // ✅ 新增：和 Master 保持一致，提升物理速率
+  esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_2M_L);
+
   esp_now_register_send_cb(onEspNowSentStatic);
   esp_now_register_recv_cb(onEspNowRecvStatic);
   return true;
@@ -511,7 +514,6 @@ bool ImuSlaveApp::storeBatch(const capture::ImuRawSample *samples, uint8_t count
   BatchSlot &slot = batchRing_[batchSeq % BATCH_RING_CAPACITY];
   if (!slot.used) {
     if (linkFaultPending_) {
-      // ring 曾经溢出时，下一包显式带上故障标记，提醒这段实验不应参与潜伏期计算。
       packet.bytes[9] |= capture::IMU_FLAG_LINK_FAULT;
       capture::writeImuBatchCrc(packet);
       linkFaultPending_ = false;
@@ -520,7 +522,8 @@ bool ImuSlaveApp::storeBatch(const capture::ImuRawSample *samples, uint8_t count
     slot.sendAttempts = 0;
     slot.batchSeq = batchSeq;
     slot.sampleStartSeq = sampleStartSeq;
-    slot.lastSendUs = 0;
+    // ✅ 优化：新包入队时，将下一次发送时间设为 0，代表“立即发送”
+    slot.nextSendUs = 0; 
     slot.packet = packet;
     ++nextBatchSeq_;
     nextSampleSeq_ += count;
@@ -537,29 +540,40 @@ bool ImuSlaveApp::storeBatch(const capture::ImuRawSample *samples, uint8_t count
 
 // 从 ring 中取出当前最应该发送或重传的 batch。
 bool ImuSlaveApp::takeSendCandidate(capture::ImuBatchWirePacket &outPacket, uint32_t nowUs) {
-  // 优先发送最早未 ACK 的 batch；如果它刚发过，则跳到后面找可重传/未发送的候选。
   bool found = false;
 
   portENTER_CRITICAL(&ringMux_);
   advanceOldestUnackedLocked();
   uint16_t seq = oldestUnackedSeq_;
   const uint16_t pendingCount = static_cast<uint16_t>(nextBatchSeq_ - oldestUnackedSeq_);
-  for (uint16_t i = 0; i < pendingCount; ++i, ++seq) {
+  
+  // ✅ 核心优化 1：发送窗口限制 (In-Flight Window Limit)
+  // 无论本地积压了多少包，我们绝不发送超越 Master 32 位接收窗口的包
+  const uint16_t windowLimit = std::min(pendingCount, static_cast<uint16_t>(32));
+
+  for (uint16_t i = 0; i < windowLimit; ++i, ++seq) {
     BatchSlot &slot = batchRing_[seq % BATCH_RING_CAPACITY];
     if (!slot.used || slot.batchSeq != seq) {
       continue;
     }
-    if (slot.lastSendUs != 0 &&
-        static_cast<uint32_t>(nowUs - slot.lastSendUs) < RETRANSMIT_INTERVAL_US) {
-      continue;
+
+    // ✅ 核心优化 2 & 4：判断是否到了该发的时间
+    // 如果 nextSendUs != 0 且当前时间还未到达 nextSendUs，跳过不发
+    if (slot.nextSendUs != 0 && static_cast<int32_t>(nowUs - slot.nextSendUs) < 0) {
+      continue; 
     }
+
     outPacket = slot.packet;
     if (slot.sendAttempts > 0) {
-      // 重传时只改 flags 和 CRC，batchSeq/sampleSeq 保持不变，Master 才能去重。
       outPacket.bytes[9] |= capture::IMU_FLAG_RETRANSMIT;
       capture::writeImuBatchCrc(outPacket);
     }
-    slot.lastSendUs = nowUs;
+
+    // ✅ 核心优化 3：带有退避抖动的重传定时器
+    // 计算下一次允许发送的绝对时间：当前时间 + 60ms + (0~15ms 随机抖动)
+    // 随机抖动彻底打破了多节点在干扰后同时试图重传的“碰撞死锁”
+    slot.nextSendUs = nowUs + RETRANSMIT_BASE_US + random(RETRANSMIT_JITTER_US);
+
     ++slot.sendAttempts;
     ++sendAttempts_;
     found = true;

@@ -62,7 +62,7 @@ class MasterApp {
 
   static constexpr size_t MAX_TRACKED_SLAVES = 16;
   static constexpr uint32_t SLAVE_OFFLINE_TIMEOUT_US = 3000000;
-  static constexpr uint32_t ACK_MIN_INTERVAL_US = 25000;
+  static constexpr uint32_t ACK_MIN_INTERVAL_US = 40000;
 
   // Arduino/ESP-NOW/FreeRTOS 需要 C 风格回调，用静态函数转发到当前 MasterApp 实例。
   static void onAdsDrdyStatic();

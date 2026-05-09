@@ -41,7 +41,8 @@ class ImuSlaveApp {
     uint8_t sendAttempts;
     uint16_t batchSeq;
     uint32_t sampleStartSeq;
-    uint32_t lastSendUs;
+    // ✅ 优化：将 lastSendUs 替换为 nextSendUs，记录下一次该发送的绝对时间
+    uint32_t nextSendUs; 
     capture::ImuBatchWirePacket packet;
   };
 
@@ -55,6 +56,9 @@ class ImuSlaveApp {
   static constexpr uint32_t SEND_SUPERFRAME_US = 20000;
   static constexpr uint8_t MAX_SENDS_PER_SLOT = 3;
   static constexpr uint32_t RETRANSMIT_INTERVAL_US = 40000;
+  // ✅ 优化：设定基础重传 60ms (容忍 Master 的 40ms ACK)，加上 0~15ms 随机抖动避免碰撞
+  static constexpr uint32_t RETRANSMIT_BASE_US = 60000;   
+  static constexpr uint32_t RETRANSMIT_JITTER_US = 15000;
   static constexpr size_t SYNC_WINDOW_CAPACITY = 128;
   static constexpr size_t SYNC_MIN_ROBUST_POINTS = 8;
   static constexpr uint8_t SYNC_OUTLIER_REJECT_PERCENT = 20;

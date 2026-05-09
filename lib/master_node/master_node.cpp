@@ -118,6 +118,10 @@ bool MasterApp::initEspNow() {
   if (esp_now_init() != ESP_OK) {
     return false;
   }
+  
+  // ✅ 新增：强制将 ESP-NOW 物理层空口速率从默认的 1Mbps 提升到 2Mbps
+  // 大幅减少数据包在空气中的发送耗时，降低被干扰的概率
+  esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_2M_L);
 
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, broadcastMac_, sizeof(broadcastMac_));
