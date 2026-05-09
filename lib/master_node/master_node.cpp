@@ -1,5 +1,5 @@
 #include "master_node.h"
-
+#include <esp_log.h> // ✅ 1. 引入 ESP-IDF 日志库
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <string.h>
@@ -16,6 +16,8 @@ MasterApp::MasterApp(const Config &config) : config_(config), ads_(config.adsPin
 // 初始化串口、ADS1298、ESP-NOW 和三个后台任务。
 void MasterApp::begin() {
   g_activeApp = this;
+  // ✅ 2. 闭嘴！禁止所有底层库（特别是 Wi-Fi）向串口乱喷 ASCII 日志
+  esp_log_level_set("*", ESP_LOG_NONE);
   // 串口队列会把 EMG 和两路 IMU 合并输出，TX buffer 适当放大以降低 USB CDC 抖动影响。
   Serial.setTxBufferSize(8192);
   Serial.begin(config_.serialBaud);
@@ -118,7 +120,7 @@ bool MasterApp::initEspNow() {
   if (esp_now_init() != ESP_OK) {
     return false;
   }
-  
+
   // ✅ 新增：强制将 ESP-NOW 物理层空口速率从默认的 1Mbps 提升到 2Mbps
   // 大幅减少数据包在空气中的发送耗时，降低被干扰的概率
   esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_2M_L);
