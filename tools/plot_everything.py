@@ -53,7 +53,7 @@ PC_MSG_SYNC_DIAG = 0x31
 PC_MSG_STATE_EVENT = 0x32
 PC_BATCH_HEADER_SIZE = 5
 PC_SAMPLE_SIZE = 24
-PC_MAX_BATCH_SAMPLES = 24
+PC_MAX_BATCH_SAMPLES = 48
 PC_BATCH_MIN_SIZE = PC_BATCH_HEADER_SIZE + PC_SAMPLE_SIZE + 2
 PC_SAMPLE_STRUCT = struct.Struct("<BIIHBiii")
 PC_SYNC_DIAG_SIZE = 24
@@ -175,7 +175,7 @@ def parse_args() -> argparse.Namespace:
     """解析 IMU/EMG 示波器的命令行参数。"""
     parser = argparse.ArgumentParser(description="按当前 CDC 协议显示 EMG / Gyro / Accel 波形。")
     parser.add_argument("--port", help="可选，手动指定串口；若不提供则自动搜索。")
-    parser.add_argument("--baud", type=int, default=921600, help="串口波特率，默认 921600。")
+    parser.add_argument("--baud", type=int, default=2_000_000, help="串口波特率，默认 2000000。")
     parser.add_argument("--window-seconds", type=float, default=2.0, help="显示窗口长度，默认 2 秒。")
     parser.add_argument("--expected-rate", type=float, default=2000.0, help="缓冲区按最高通道采样率预估，默认 2000Hz。")
     parser.add_argument("--emg-display-rate", type=float, default=2000.0, help="EMG 显示滤波器采样率，默认 2000Hz。")

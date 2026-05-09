@@ -8,7 +8,7 @@ namespace {
 // 参数依次为 ADS1298 引脚 {CS, MOSI, MISO, SCK, DRDY, RESET} 和 USB CDC 波特率。
 MasterApp g_app({
     {10, 11, 13, 12, 9, 14},
-    921600,
+    2000000,
 });
 
 }  // namespace

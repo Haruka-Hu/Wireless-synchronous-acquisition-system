@@ -19,7 +19,7 @@ void MasterApp::begin() {
   // ✅ 2. 闭嘴！禁止所有底层库（特别是 Wi-Fi）向串口乱喷 ASCII 日志
   esp_log_level_set("*", ESP_LOG_NONE);
   // 串口队列会把 EMG 和两路 IMU 合并输出，TX buffer 适当放大以降低 USB CDC 抖动影响。
-  Serial.setTxBufferSize(8192);
+  Serial.setTxBufferSize(16384);
   Serial.begin(config_.serialBaud);
   Serial.setTxTimeoutMs(1000);
   delay(300);
@@ -27,13 +27,13 @@ void MasterApp::begin() {
   ads_.begin(onAdsDrdyStatic);
   // slaveRxQueue_ 承接 ESP-NOW 回调；serialQueue_ 承接所有准备发给 PC 的样本。
   slaveRxQueue_ = xQueueCreate(512, sizeof(SlaveRxItem));
-  serialQueue_ = xQueueCreate(2048, sizeof(capture::PcSample));
+  serialQueue_ = xQueueCreate(4096, sizeof(capture::PcSample));
   serialWriteMux_ = xSemaphoreCreateMutex();
   initEspNow();
 
   // 串口写、无线处理、ADS 采样分开跑，避免任一路 I/O 抖动拖慢其他链路。
   xTaskCreatePinnedToCore(wirelessTaskStatic, "masterWireless", 4096, this, 7, nullptr, 0);
-  xTaskCreatePinnedToCore(serialTxTaskStatic, "serialTx", 4096, this, 4, nullptr, 0);
+  xTaskCreatePinnedToCore(serialTxTaskStatic, "serialTx", 4096, this, 6, nullptr, 0);
   xTaskCreatePinnedToCore(sensorTaskStatic, "masterSensor", 4096, this, 5, nullptr, 1);
   xTaskCreatePinnedToCore(serialCommandTaskStatic, "serialCommand", 4096, this, 3, nullptr, 0);
 }
@@ -661,8 +661,8 @@ void MasterApp::wirelessTask() {
       const uint32_t linkEventDelta = (slaveDuplicatePackets_ - lastDuplicatePackets) +
                                       (slaveRetransmitPackets_ - lastRetransmitPackets) +
                                       (slaveMissingPackets_ - lastMissingPackets);
-      const int32_t hardErrorDelta = static_cast<int32_t>((slaveDecodeFails_ - lastDecodeFails) +
-                                                          (slaveCrcFails_ - lastCrcFails) +
+      const uint32_t decodeFailDelta = slaveDecodeFails_ - lastDecodeFails;
+      const int32_t hardErrorDelta = static_cast<int32_t>(decodeFailDelta +
                                                           queueDropDelta +
                                                           (serialWriteShorts_ - lastSerialWriteShorts) +
                                                           (slaveRegistryDrops_ - lastRegistryDrops) +
