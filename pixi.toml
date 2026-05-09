@@ -21,6 +21,7 @@ bleak = ">=0.22,<1"
 
 [tasks]
 host = "python tools/imu_scope.py"
+host-v2 = "python tools/plot_everything.py"
 host-help = "python tools/imu_scope.py --help"
 host-list-ports = "python tools/imu_scope.py --list-ports"
 delay = "python tools/analyze_imu_delay.py"
