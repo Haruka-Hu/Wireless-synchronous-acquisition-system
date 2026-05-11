@@ -1,368 +1,196 @@
-% Analyze IMU CSV files under data/.
-%
-% The script displays the acceleration resultant waveform, detects knock
-% instants from the 3-axis acceleration magnitude, then estimates the latency
-% from each knock to the first shank swing onset detected on gyroscope gz.
+% =========================================================================
+% IMU与肌电(EMG)多通道潜伏期自动化分析脚本 (V9 独立窗口展示版)
+% 核心逻辑：
+% 1. 峰值回溯与角度积分计算潜伏期。
+% 2. 【展示更新】为每一次敲击单独生成一个Figure窗口，聚焦局部特征。
+% =========================================================================
 
 clear; clc; close all;
 
-scriptDir = fileparts(mfilename("fullpath"));
-projectRoot = fileparts(scriptDir);
+% --- 用户配置区 ---
+filename = 'data/imu_capture_20260511_201534.csv';
+gyro_axis = 'x';                              
+notch_freq = 50;                              
+min_tap_interval = 1.0; % 两次叩击最小间隔(秒)
+% --------------------
 
-params.dataDir = fullfile(projectRoot, "data");
-params.filePattern = "*.csv";
+fprintf('正在读取并清洗数据...\n');
+data = readtable(filename);
 
-% Detection parameters. Tune these first if a recording is very noisy or weak.
-params.accBaselineWindowSec = 0.25;
-params.knockThresholdMad = 8.0;
-params.knockMinPeakDistanceSec = 0.03; % Merge tiny peak jitter within one acceleration peak.
-params.knockPeakGroupGapSec = 1.00;    % Candidate peaks closer than this belong to one knock burst.
-params.knockPeaksPerEvent = 3;         % A knock usually has 3 accel peaks; use the last one.
-params.maxKnocksPerFile = inf;
+% 1. 数据分离与严格清洗
+idx_acc = strcmp(data.source, 'Accel');
+idx_gyro = strcmp(data.source, 'Gyro');
+idx_emg = strcmp(data.source, 'EMG');
 
-params.gyroPreWindowSec = 0.30;
-params.gyroIgnoreAfterKnockSec = 0.015;
-params.gyroSearchWindowSec = 1.00;
-params.gyroThresholdMad = 6.0;
-params.gyroMinAbsThreshold = 40;       % Raw gz units.
-params.gyroHoldSec = 0.020;            % Threshold must hold this long.
+[~, u_idx_acc]  = unique(data.timestamp_us(idx_acc));
+[~, u_idx_gyro] = unique(data.timestamp_us(idx_gyro));
+[~, u_idx_emg]  = unique(data.timestamp_us(idx_emg));
 
-params.saveSummaryCsv = true;
-params.saveFigures = false;
-params.outputDir = fullfile(params.dataDir, "analysis");
+acc_data  = data(find(idx_acc), :);  acc_data  = acc_data(u_idx_acc, :);
+gyro_data = data(find(idx_gyro), :); gyro_data = gyro_data(u_idx_gyro, :);
+emg_data  = data(find(idx_emg), :);  emg_data  = emg_data(u_idx_emg, :);
 
-files = dir(fullfile(params.dataDir, params.filePattern));
-if isempty(files)
-    error("No CSV files found in %s", params.dataDir);
+% 2. 统一时间节点
+min_time_us = min([acc_data.timestamp_us; gyro_data.timestamp_us; emg_data.timestamp_us]);
+t_acc = (acc_data.timestamp_us - min_time_us) / 1e6;
+t_gyro = (gyro_data.timestamp_us - min_time_us) / 1e6;
+t_emg = (emg_data.timestamp_us - min_time_us) / 1e6;
+
+Fs_acc = 1 / mean(diff(t_acc)); Fs_gyro = 1 / mean(diff(t_gyro)); Fs_emg = 1 / mean(diff(t_emg));
+
+% 3. 零相移滤波处理
+Q = 35; w0 = notch_freq / (Fs_emg / 2); bw = w0 / Q;                     
+[b_notch, a_notch] = iirnotch(w0, bw);
+high_cutoff = min(400, (Fs_emg/2) * 0.95); 
+[b_emg, a_emg] = butter(4, [20, high_cutoff] / (Fs_emg / 2), 'bandpass');
+
+emg_x_filt = filtfilt(b_emg, a_emg, filtfilt(b_notch, a_notch, emg_data.x));
+emg_y_filt = filtfilt(b_emg, a_emg, filtfilt(b_notch, a_notch, emg_data.y));
+emg_z_filt = filtfilt(b_emg, a_emg, filtfilt(b_notch, a_notch, emg_data.z));
+
+[b_acc, a_acc] = butter(4, 20 / (Fs_acc / 2), 'low');
+acc_norm_filt = filtfilt(b_acc, a_acc, acc_data.vector_norm);
+
+switch lower(gyro_axis)
+    case 'x', gyro_sig_raw = gyro_data.x; case 'y', gyro_sig_raw = gyro_data.y; case 'z', gyro_sig_raw = gyro_data.z;
+end
+[b_gyro, a_gyro] = butter(4, 20 / (Fs_gyro / 2), 'low');
+gyro_sig_filt = filtfilt(b_gyro, a_gyro, gyro_sig_raw);
+
+% 4. 信号降维与处理
+emg_combined = sqrt(emg_x_filt.^2 + emg_y_filt.^2 + emg_z_filt.^2);
+emg_env = movmean(emg_combined, round(Fs_emg * 0.01)); 
+
+dt_gyro = 1 / Fs_gyro;
+gyro_angle_raw = cumtrapz(t_gyro, gyro_sig_filt); 
+[b_hp, a_hp] = butter(2, 0.5 / (Fs_gyro / 2), 'high');
+gyro_angle = filtfilt(b_hp, a_hp, gyro_angle_raw);
+angle_env = movmean(abs(gyro_angle), round(Fs_gyro * 0.02));
+
+% =========================================================================
+% 5. 峰值回溯法寻找叩击时刻 (T_tap)
+% =========================================================================
+baseline_acc = mean(acc_norm_filt(1:round(Fs_acc*1.0)));
+peak_thresh = baseline_acc + 6 * std(acc_norm_filt(1:round(Fs_acc*1.0)));
+[pks, locs] = findpeaks(acc_norm_filt, 'MinPeakHeight', peak_thresh, 'MinPeakDistance', round(min_tap_interval * Fs_acc));
+
+tap_times = [];
+tap_peaks = [];
+
+for i = 1:length(locs)
+    peak_idx = locs(i);
+    tap_peaks(end+1) = t_acc(peak_idx);
+    
+    base_start = max(1, peak_idx - round(Fs_acc * 0.2));
+    base_end = max(1, peak_idx - round(Fs_acc * 0.1));
+    local_base = acc_norm_filt(base_start:base_end);
+    local_thresh = mean(local_base) + 4 * std(local_base);
+    
+    search_start = max(1, peak_idx - round(Fs_acc * 0.1));
+    search_window = acc_norm_filt(search_start : peak_idx);
+    
+    idx_below = find(search_window < local_thresh, 1, 'last');
+    if isempty(idx_below)
+        tap_idx = peak_idx; 
+    else
+        tap_idx = search_start + idx_below; 
+    end
+    tap_times(end+1) = t_acc(tap_idx);
 end
 
-allResults = table();
+% =========================================================================
+% 6. 计算潜伏期与逐个弹窗绘图
+% =========================================================================
+fprintf('\n================ 腱反射独立视图分析报告 ================\n');
+fprintf('共检测到 %d 次叩击。\n\n', length(tap_times));
 
-for fileIdx = 1:numel(files)
-    csvPath = fullfile(files(fileIdx).folder, files(fileIdx).name);
-    fprintf("\n=== %s ===\n", files(fileIdx).name);
+results_emg_onset = NaN(1, length(tap_times)); 
+results_angle_onset = NaN(1, length(tap_times));
 
-    T = readtable(csvPath);
-    requiredVars = ["source", "timestamp_us", "x", "y", "z"];
-    missingVars = setdiff(requiredVars, string(T.Properties.VariableNames));
-    if ~isempty(missingVars)
-        warning("Skip %s: missing columns: %s", files(fileIdx).name, strjoin(missingVars, ", "));
-        continue;
+for i = 1:length(tap_times)
+    t_tap = tap_times(i);
+    fprintf('【第 %d 次】 物理接触时刻: %.4f 秒\n', i, t_tap);
+    
+    % --- 肌电潜伏期 ---
+    base_idx_emg = t_emg > (t_tap - 0.5) & t_emg < (t_tap - 0.05);
+    if ~any(base_idx_emg), base_idx_emg = 1:round(Fs_emg*0.1); end
+    thresh_emg = mean(emg_env(base_idx_emg)) + 5 * std(emg_env(base_idx_emg)); 
+    
+    search_idx_emg = find(t_emg >= (t_tap + 0.005) & t_emg <= (t_tap + 0.15));
+    exceeds_emg = emg_env(search_idx_emg) > thresh_emg;
+    edges_emg = diff([0; exceeds_emg; 0]);
+    starts_emg = find(edges_emg == 1); ends_emg = find(edges_emg == -1);
+    
+    valid_emg = find((ends_emg - starts_emg) >= round(Fs_emg * 0.01), 1, 'first');
+    if ~isempty(valid_emg)
+        results_emg_onset(i) = t_emg(search_idx_emg(starts_emg(valid_emg)));
+        fprintf('  ▶ 肌电潜伏期: \t %.2f ms\n', (results_emg_onset(i) - t_tap) * 1000);
+    else
+        fprintf('  ▶ 肌电潜伏期: \t 未检测到有效爆发\n');
     end
-
-    source = string(T.source);
-    isAccel = strcmpi(source, "Accel");
-    isGyro = strcmpi(source, "Gyro");
-
-    if ~any(isAccel) || ~any(isGyro)
-        warning("Skip %s: both Accel and Gyro rows are required.", files(fileIdx).name);
-        continue;
+    
+    % --- 摆动角度潜伏期 ---
+    base_idx_angle = t_gyro > (t_tap - 0.5) & t_gyro < (t_tap - 0.05);
+    if ~any(base_idx_angle), base_idx_angle = 1:round(Fs_gyro*0.1); end
+    thresh_angle = mean(angle_env(base_idx_angle)) + 5 * std(angle_env(base_idx_angle));
+    
+    search_idx_angle = find(t_gyro >= (t_tap + 0.015) & t_gyro <= (t_tap + 0.40)); 
+    exceeds_angle = angle_env(search_idx_angle) > thresh_angle;
+    edges_angle = diff([0; exceeds_angle; 0]);
+    starts_angle = find(edges_angle == 1); ends_angle = find(edges_angle == -1);
+    
+    valid_angle = find((ends_angle - starts_angle) >= round(Fs_gyro * 0.025), 1, 'first');
+    if ~isempty(valid_angle)
+        results_angle_onset(i) = t_gyro(search_idx_angle(starts_angle(valid_angle)));
+        fprintf('  ▶ 摆动潜伏期: \t %.2f ms\n', (results_angle_onset(i) - t_tap) * 1000);
+    else
+        fprintf('  ▶ 摆动潜伏期: \t 未检测到有效角度变化\n');
     end
+    fprintf('---------------------------------------------------\n');
+    
+    % =====================================================================
+    % 为当前这次叩击生成专属的独立视图
+    % =====================================================================
+    fig_name = sprintf('第 %d 次叩击微观视图 (时间点: %.2f秒)', i, t_tap);
+    figure('Name', fig_name, 'Position', [50 + i*30, 50 + i*30, 1000, 800]);
+    
+    plot_vars = {emg_x_filt, emg_y_filt, emg_z_filt}; 
+    titles = {sprintf('第%d次: 肌电 EMG X轴', i), '肌电 EMG Y轴', '肌电 EMG Z轴'};
+    axs = gobjects(5, 1);
 
-    t0Us = min(double(T.timestamp_us(isAccel | isGyro)));
-
-    acc = sortrows(T(isAccel, :), "timestamp_us");
-    gyro = sortrows(T(isGyro, :), "timestamp_us");
-
-    tAcc = (double(acc.timestamp_us) - t0Us) / 1e6;
-    ax = double(acc.x);
-    ay = double(acc.y);
-    az = double(acc.z);
-    accMag = sqrt(ax.^2 + ay.^2 + az.^2);
-
-    tGyro = (double(gyro.timestamp_us) - t0Us) / 1e6;
-    gz = double(gyro.z);
-
-    [knockTimes, knockAmps, accDynamic, accScore, accThreshold] = detectKnocks(tAcc, accMag, params);
-    if isfinite(params.maxKnocksPerFile) && numel(knockTimes) > params.maxKnocksPerFile
-        knockTimes = knockTimes(1:params.maxKnocksPerFile);
-        knockAmps = knockAmps(1:params.maxKnocksPerFile);
-    end
-
-    nKnocks = numel(knockTimes);
-    swingTimes = nan(nKnocks, 1);
-    latenciesMs = nan(nKnocks, 1);
-    gyroThresholds = nan(nKnocks, 1);
-
-    for k = 1:nKnocks
-        [swingTimes(k), gyroThresholds(k)] = detectSwingOnset(tGyro, gz, knockTimes(k), params);
-        if isfinite(swingTimes(k))
-            latenciesMs(k) = (swingTimes(k) - knockTimes(k)) * 1000;
+    % 画肌电三通道
+    for j = 1:3
+        axs(j) = subplot(5, 1, j); 
+        plot(t_emg, plot_vars{j}, 'Color', [0.7 0.7 0.7], 'LineWidth', 0.5); hold on;
+        if j == 1, plot(t_emg, emg_env, 'r', 'LineWidth', 1.5, 'DisplayName','总包络线'); legend('Location', 'northeast'); end
+        title(titles{j}, 'FontSize', 10, 'FontWeight', 'bold'); ylabel('Amplitude'); grid on;
+        
+        % 只画当前敲击的辅助线
+        xline(t_tap, 'r--', 'LineWidth', 1.5, 'Label', 'Tap');
+        if ~isnan(results_emg_onset(i))
+            xline(results_emg_onset(i), 'g-', 'LineWidth', 1.5, 'Label', 'EMG Onset'); 
         end
     end
 
-    result = table( ...
-        repmat(string(files(fileIdx).name), nKnocks, 1), ...
-        (1:nKnocks)', ...
-        knockTimes(:), ...
-        knockAmps(:), ...
-        swingTimes(:), ...
-        latenciesMs(:), ...
-        gyroThresholds(:), ...
-        'VariableNames', ["file", "knock_index", "knock_time_s", "acc_peak_raw", ...
-                          "swing_onset_time_s", "latency_ms", "gyro_threshold_raw"]);
+    % 画加速度
+    axs(4) = subplot(5, 1, 4); 
+    plot(t_acc, acc_norm_filt, 'k', 'LineWidth', 1.0); hold on; 
+    plot(tap_peaks(i), acc_norm_filt(t_acc == tap_peaks(i)), 'bo', 'MarkerSize', 8, 'LineWidth', 2, 'DisplayName','波峰');
+    xline(t_tap, 'r--', 'LineWidth', 1.5, 'Label', '起跳点');
+    title(sprintf('第%d次: 加速度模长 (峰值回溯)', i), 'FontSize', 10, 'FontWeight', 'bold'); 
+    ylabel('Norm'); grid on; legend('Location', 'northeast');
 
-    if nKnocks == 0
-        fprintf("No knock detected. Try lowering params.knockThresholdMad.\n");
-    else
-        disp(result(:, ["knock_index", "knock_time_s", "swing_onset_time_s", "latency_ms"]));
-        allResults = [allResults; result]; %#ok<AGROW>
+    % 画关节角度
+    axs(5) = subplot(5, 1, 5); 
+    plot(t_gyro, gyro_angle, 'Color', [0.8500 0.3250 0.0980], 'LineWidth', 1.5); hold on; 
+    xline(t_tap, 'r--', 'LineWidth', 1.5);
+    if ~isnan(results_angle_onset(i))
+        xline(results_angle_onset(i), 'b-', 'LineWidth', 1.5, 'Label', 'Angle Onset'); 
     end
+    title(sprintf('第%d次: 关节运动角度 (由 Gyro %s 轴积分)', i, upper(gyro_axis)), 'FontSize', 10, 'FontWeight', 'bold'); 
+    xlabel('时间 (秒)', 'FontSize', 11); ylabel('Angle (Deg)'); grid on;
 
-    plotAnalysis(files(fileIdx).name, tAcc, accMag, accDynamic, accScore, accThreshold, ...
-                 tGyro, gz, knockTimes, swingTimes, latenciesMs, params);
-
-    if params.saveFigures
-        if ~exist(params.outputDir, "dir")
-            mkdir(params.outputDir);
-        end
-        [~, baseName] = fileparts(files(fileIdx).name);
-        saveas(gcf, fullfile(params.outputDir, baseName + "_knock_latency.png"));
-    end
-end
-
-if params.saveSummaryCsv && ~isempty(allResults)
-    if ~exist(params.outputDir, "dir")
-        mkdir(params.outputDir);
-    end
-    outPath = fullfile(params.outputDir, "knock_latency_summary.csv");
-    writetable(allResults, outPath);
-    fprintf("\nSummary written to %s\n", outPath);
-end
-
-function [knockTimes, knockAmps, accDynamic, score, threshold] = detectKnocks(t, accMag, params)
-    dt = estimateSampleInterval(t);
-    baselineWin = secondsToOddSamples(params.accBaselineWindowSec, dt);
-    accBaseline = movmedian(accMag, baselineWin);
-    accDynamic = accMag - accBaseline;
-    score = abs(accDynamic);
-
-    threshold = medianFinite(score) + params.knockThresholdMad * robustMad(score);
-    minPeakDistSamples = max(1, round(params.knockMinPeakDistanceSec / dt));
-
-    candidateIdx = localPeaksAboveThreshold(score, threshold, minPeakDistSamples);
-    peakIdx = selectKnockStartPeaks(candidateIdx, t, params.knockPeakGroupGapSec, params.knockPeaksPerEvent);
-
-    knockTimes = t(peakIdx);
-    knockAmps = accMag(peakIdx);
-end
-
-function [swingTime, threshold] = detectSwingOnset(tGyro, gz, knockTime, params)
-    swingTime = nan;
-
-    preMask = tGyro >= knockTime - params.gyroPreWindowSec & tGyro < knockTime - params.gyroIgnoreAfterKnockSec;
-    if nnz(preMask) >= 5
-        baseline = medianFinite(gz(preMask));
-        noise = abs(gz(preMask) - baseline);
-        threshold = max(params.gyroMinAbsThreshold, medianFinite(noise) + params.gyroThresholdMad * robustMad(noise));
-    else
-        baseline = medianFinite(gz);
-        noise = abs(gz - baseline);
-        threshold = max(params.gyroMinAbsThreshold, medianFinite(noise) + params.gyroThresholdMad * robustMad(noise));
-    end
-
-    searchMask = tGyro >= knockTime + params.gyroIgnoreAfterKnockSec & ...
-                 tGyro <= knockTime + params.gyroSearchWindowSec;
-    searchIdx = find(searchMask);
-    if isempty(searchIdx)
-        return;
-    end
-
-    dt = estimateSampleInterval(tGyro);
-    holdSamples = max(1, round(params.gyroHoldSec / dt));
-    above = abs(gz(searchIdx) - baseline) >= threshold;
-
-    firstLocal = firstSustainedTrue(above, holdSamples);
-    if ~isnan(firstLocal)
-        swingTime = tGyro(searchIdx(firstLocal));
-    end
-end
-
-function plotAnalysis(fileName, tAcc, accMag, accDynamic, accScore, accThreshold, ...
-                      tGyro, gz, knockTimes, swingTimes, latenciesMs, params)
-    figure("Name", "Knock latency - " + fileName, "Color", "w");
-    tiledlayout(3, 1, "TileSpacing", "compact", "Padding", "compact");
-
-    nexttile;
-    hAccRaw = plot(tAcc, accMag, "k-", "LineWidth", 0.8); hold on;
-    hAccDyn = plot(tAcc, accDynamic + medianFinite(accMag), "Color", [0.20 0.55 0.90], "LineWidth", 0.7);
-    legendHandles = [hAccRaw, hAccDyn];
-    legendLabels = ["|a| raw", "|a| dynamic + offset"];
-    if ~isempty(knockTimes)
-        knockAcc = sampleAtTimes(tAcc, accMag, knockTimes);
-        hKnock = plot(knockTimes, knockAcc, "rv", "MarkerFaceColor", "r", "MarkerSize", 7);
-        legendHandles = [legendHandles, hKnock];
-        legendLabels = [legendLabels, "knock"];
-    end
-    addEventLines(knockTimes, [0.85 0.10 0.10], "--");
-    grid on;
-    ylabel("Accel norm");
-    title("Acceleration resultant: knock detection");
-    legend(legendHandles, legendLabels, "Location", "best");
-
-    nexttile;
-    hGz = plot(tGyro, gz, "Color", [0.10 0.10 0.10], "LineWidth", 0.8); hold on;
-    addEventLines(knockTimes, [0.85 0.10 0.10], "--");
-    addEventLines(swingTimes(isfinite(swingTimes)), [0.00 0.45 0.20], "-");
-    hKnockLine = plot(nan, nan, "--", "Color", [0.85 0.10 0.10], "LineWidth", 1.1);
-    hSwingLine = plot(nan, nan, "-", "Color", [0.00 0.45 0.20], "LineWidth", 1.1);
-    grid on;
-    ylabel("gz raw");
-    title("Gyroscope gz: shank swing onset");
-    legend([hGz, hKnockLine, hSwingLine], ["gz", "knock", "swing onset"], "Location", "best");
-
-    nexttile;
-    if any(isfinite(latenciesMs))
-        stem(find(isfinite(latenciesMs)), latenciesMs(isfinite(latenciesMs)), "filled", ...
-             "Color", [0.00 0.35 0.75], "LineWidth", 1.2);
-    else
-        text(0.5, 0.5, "No valid latency found", "HorizontalAlignment", "center");
-    end
-    grid on;
-    xlabel("Knock index");
-    ylabel("Latency (ms)");
-    title(sprintf("Latency = swing onset(gz) - knock(acc), gyro threshold >= %.0f raw units", ...
-          max(params.gyroMinAbsThreshold, 0)));
-
-    % Show the acceleration score threshold without adding another subplot.
-    fprintf("Acceleration score threshold: %.3f raw units\n", accThreshold);
-    if ~isempty(accScore)
-        fprintf("Acceleration score max: %.3f raw units\n", max(accScore));
-    end
-end
-
-function peakIdx = localPeaksAboveThreshold(y, threshold, minDistSamples)
-    y = y(:);
-    if numel(y) < 3
-        peakIdx = [];
-        return;
-    end
-
-    candidateIdx = find(y(2:end-1) >= y(1:end-2) & y(2:end-1) > y(3:end) & y(2:end-1) >= threshold) + 1;
-    if isempty(candidateIdx)
-        peakIdx = [];
-        return;
-    end
-
-    [~, order] = sort(y(candidateIdx), "descend");
-    candidateIdx = candidateIdx(order);
-    accepted = false(size(candidateIdx));
-
-    for i = 1:numel(candidateIdx)
-        idx = candidateIdx(i);
-        if ~any(abs(idx - candidateIdx(accepted)) < minDistSamples)
-            accepted(i) = true;
-        end
-    end
-
-    peakIdx = sort(candidateIdx(accepted));
-end
-
-function selectedIdx = selectKnockStartPeaks(candidateIdx, t, groupGapSec, peaksPerEvent)
-    candidateIdx = sort(candidateIdx(:));
-    if isempty(candidateIdx)
-        selectedIdx = [];
-        return;
-    end
-
-    candidateTimes = t(candidateIdx);
-    selectedIdx = [];
-    groupStart = 1;
-
-    for i = 2:numel(candidateIdx)
-        if candidateTimes(i) - candidateTimes(i - 1) > groupGapSec
-            groupIdx = candidateIdx(groupStart:i - 1);
-            pickLocal = min(peaksPerEvent, numel(groupIdx));
-            selectedIdx(end + 1, 1) = groupIdx(pickLocal); %#ok<AGROW>
-            groupStart = i;
-        end
-    end
-
-    groupIdx = candidateIdx(groupStart:end);
-    pickLocal = min(peaksPerEvent, numel(groupIdx));
-    selectedIdx(end + 1, 1) = groupIdx(pickLocal);
-end
-
-function yq = sampleAtTimes(t, y, tq)
-    t = t(:);
-    y = y(:);
-    tq = tq(:);
-
-    [tUnique, uniqueIdx] = unique(t, "stable");
-    yUnique = y(uniqueIdx);
-
-    if numel(tUnique) == 1
-        yq = repmat(yUnique(1), size(tq));
-    else
-        yq = interp1(tUnique, yUnique, tq, "linear", "extrap");
-    end
-end
-
-function firstIdx = firstSustainedTrue(mask, holdSamples)
-    firstIdx = nan;
-    if isempty(mask)
-        return;
-    end
-    runLength = 0;
-    for i = 1:numel(mask)
-        if mask(i)
-            runLength = runLength + 1;
-            if runLength >= holdSamples
-                firstIdx = i - holdSamples + 1;
-                return;
-            end
-        else
-            runLength = 0;
-        end
-    end
-end
-
-function dt = estimateSampleInterval(t)
-    diffs = diff(t(:));
-    diffs = diffs(isfinite(diffs) & diffs > 0);
-    if isempty(diffs)
-        dt = 1e-3;
-    else
-        dt = median(diffs);
-    end
-end
-
-function n = secondsToOddSamples(seconds, dt)
-    n = max(3, round(seconds / dt));
-    if mod(n, 2) == 0
-        n = n + 1;
-    end
-end
-
-function m = medianFinite(x)
-    x = x(isfinite(x));
-    if isempty(x)
-        m = nan;
-    else
-        m = median(x);
-    end
-end
-
-function s = robustMad(x)
-    x = x(isfinite(x));
-    if isempty(x)
-        s = 0;
-        return;
-    end
-    med = median(x);
-    s = 1.4826 * median(abs(x - med));
-    if ~isfinite(s) || s == 0
-        s = std(x);
-    end
-    if ~isfinite(s) || s == 0
-        s = eps;
-    end
-end
-
-function addEventLines(times, color, lineStyle)
-    times = times(:);
-    times = times(isfinite(times));
-    for i = 1:numel(times)
-        xline(times(i), lineStyle, "Color", color, "LineWidth", 1.1);
-    end
+    % 关联子图X轴，并锁定观测窗口 (敲击前0.5秒 ~ 敲击后0.8秒)
+    linkaxes(axs, 'x'); 
+    xlim([t_tap - 0.5, t_tap + 0.8]);
 end

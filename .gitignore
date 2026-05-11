@@ -37,4 +37,9 @@ lib/main copy.cpp
 data/
 .vscode
 .claude
+Beamer/
+src_past/
+pixi.toml
+pixi.lock
+platformio.ini
 
