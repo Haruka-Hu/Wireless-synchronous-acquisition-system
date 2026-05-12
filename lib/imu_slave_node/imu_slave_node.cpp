@@ -381,6 +381,34 @@ void ImuSlaveApp::updateClockFitLocked() {
       double robustIntercept = 0.0;
       double robustResidualRms = 0.0;
       if (fitClockModelLocked(includeMask, robustSlope, robustIntercept, robustResidualRms)) {
+        
+        // === 👇 核心数学黑魔法：PPM 平滑与重心约束 👇 ===
+        if (clockModelValid_) {
+          // 1. 手动计算这批优质数据点（includeMask 为 true）的物理重心
+          const uint8_t oldestIndex = static_cast<uint8_t>((syncPointHead_ + SYNC_WINDOW_CAPACITY - syncPointCount_) % SYNC_WINDOW_CAPACITY);
+          const SyncPoint &base = syncPoints_[oldestIndex];
+          double sumX = 0.0;
+          double sumY = 0.0;
+          
+          for (uint8_t i = 0; i < syncPointCount_; ++i) {
+            if (includeMask[i]) {
+              const uint8_t index = static_cast<uint8_t>((oldestIndex + i) % SYNC_WINDOW_CAPACITY);
+              sumX += static_cast<double>(static_cast<uint32_t>(syncPoints_[index].localUs - base.localUs));
+              sumY += static_cast<double>(static_cast<int32_t>(syncPoints_[index].masterUs - base.masterUs));
+            }
+          }
+          
+          double centroidX = static_cast<double>(base.localUs) + (sumX / static_cast<double>(includedCount));
+          double centroidY = static_cast<double>(base.masterUs) + (sumY / static_cast<double>(includedCount));
+
+          // 2. IIR 滤波：给斜率（PPM）加上极大的惯性，彻底抹平空口延迟带来的震荡
+          robustSlope = 0.8 * clockSlope_ + 0.2 * robustSlope;
+          
+          // 3. 截距补偿：将滤波后的新斜率，绕着真实的“数据重心”强行扭转，防止基准线偏移
+          robustIntercept = centroidY - robustSlope * centroidX;
+        }
+        // === 👆 黑魔法结束 👆 ===
+
         slope = robustSlope;
         intercept = robustIntercept;
         residualRms = robustResidualRms;

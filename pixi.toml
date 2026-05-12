@@ -14,11 +14,11 @@ matplotlib = ">=3.8,<4"
 pyqtgraph = ">=0.13.7,<0.14"
 pyside6 = ">=6.7,<7"
 pyopengl = ">=3.1.7,<4"
-platformio = ">=6.1,<7"
 pandas = ">=3.0.2,<4"
 
 [pypi-dependencies]
 bleak = ">=0.22,<1"
+platformio = ">=6.1.19,<7"  # 把它加到这里
 
 [tasks]
 host = "python tools/imu_scope.py"
