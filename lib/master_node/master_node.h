@@ -31,6 +31,7 @@ class MasterApp {
   struct SlaveRxItem {
     uint8_t mac[6];
     uint8_t len;
+    uint32_t rxTimeUs;
     uint8_t bytes[capture::IMU_BATCH_WIRE_SIZE];
   };
 
@@ -117,6 +118,8 @@ class MasterApp {
   bool sendAck(SlaveRxState &state, uint32_t nowUs);
   // 合并并限速发送所有 Slave 的待发 ACK。
   void sendPendingAcks(uint32_t nowUs);
+  // 回复 Slave 发起的双向同步探针。
+  void handleSyncProbe(const SlaveRxItem &item);
 
   // 串口输出统一入口。所有来源最终都先进入 serialQueue_，再由 serialTxTask 合批写出。
   void writeSerialSample(uint8_t source,

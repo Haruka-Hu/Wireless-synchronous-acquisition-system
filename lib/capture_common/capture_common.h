@@ -48,6 +48,8 @@ constexpr size_t IMU_BATCH_WIRE_SIZE = IMU_BATCH_HEADER_SIZE + IMU_BATCH_SIZE * 
 constexpr size_t IMU_ACK_WIRE_SIZE = 18;
 constexpr size_t COMMAND_WIRE_SIZE = 10;
 constexpr size_t STATE_ACK_WIRE_SIZE = 11;
+constexpr size_t SYNC_PROBE_WIRE_SIZE = 10;
+constexpr size_t SYNC_REPLY_WIRE_SIZE = 18;
 constexpr size_t SYNC_DIAG_WIRE_SIZE = 21;
 constexpr size_t PC_SYNC_DIAG_PAYLOAD_SIZE = 17;
 constexpr size_t PC_STATE_EVENT_PAYLOAD_SIZE = 8;
@@ -96,6 +98,22 @@ struct SyncDiagPacket {
   int32_t driftPpm;
   int32_t residualUs;
   uint16_t beaconCount;
+};
+
+// Slave 主动发起的双向同步探针，时间戳 T1 使用 Slave 本地 micros()。
+struct SyncProbePacket {
+  uint8_t source;
+  uint16_t probeSeq;
+  uint32_t slaveT1LocalUs;
+};
+
+// Master 回复双向同步探针，携带 T1/T2/T3 供 Slave 在收到时补 T4。
+struct SyncReplyPacket {
+  uint8_t source;
+  uint16_t probeSeq;
+  uint32_t slaveT1LocalUs;
+  uint32_t masterT2RecvUs;
+  uint32_t masterT3SendUs;
 };
 
 // Slave 采样任务内部使用的原始样本：时间戳已经换算到 Master 时间轴。
@@ -208,6 +226,15 @@ void buildStateAckPacket(uint8_t source,
                          uint32_t effectiveMasterTimeUs,
                          uint8_t outBytes[STATE_ACK_WIRE_SIZE]);
 bool decodeStateAckPacket(const uint8_t *data, int len, StateAckPacket &outAck);
+
+void buildSyncProbePacket(uint8_t source,
+                          uint16_t probeSeq,
+                          uint32_t slaveT1LocalUs,
+                          uint8_t outBytes[SYNC_PROBE_WIRE_SIZE]);
+bool decodeSyncProbePacket(const uint8_t *data, int len, SyncProbePacket &outProbe);
+
+void buildSyncReplyPacket(const SyncReplyPacket &reply, uint8_t outBytes[SYNC_REPLY_WIRE_SIZE]);
+bool decodeSyncReplyPacket(const uint8_t *data, int len, SyncReplyPacket &outReply);
 
 void buildSyncDiagPacket(const SyncDiagPacket &diag, uint8_t outBytes[SYNC_DIAG_WIRE_SIZE]);
 bool decodeSyncDiagPacket(const uint8_t *data, int len, SyncDiagPacket &outDiag);

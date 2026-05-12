@@ -24,6 +24,10 @@ void ImuSlaveApp::begin() {
   delay(300);
 
   mpu_.begin();
+  dataReadyInterruptEnabled_ = mpu_.hasDataReadyInterrupt();
+  if (dataReadyInterruptEnabled_) {
+    attachInterrupt(digitalPinToInterrupt(mpu_.dataReadyInterruptPin()), onMpuDataReadyStatic, RISING);
+  }
   sendDoneSem_ = xSemaphoreCreateBinary();
   initEspNow();
 
@@ -43,6 +47,13 @@ void ImuSlaveApp::onEspNowSentStatic(const uint8_t *, esp_now_send_status_t stat
 void ImuSlaveApp::onEspNowRecvStatic(const uint8_t *mac, const uint8_t *data, int len) {
   if (g_activeApp != nullptr) {
     g_activeApp->onEspNowRecv(mac, data, len);
+  }
+}
+
+// MPU6500 DATA_RDY 中断的静态转发入口。
+void IRAM_ATTR ImuSlaveApp::onMpuDataReadyStatic() {
+  if (g_activeApp != nullptr) {
+    g_activeApp->onMpuDataReadyFromIsr();
   }
 }
 
@@ -69,9 +80,21 @@ void ImuSlaveApp::onEspNowSent(esp_now_send_status_t status) {
   }
 }
 
-// 根据下行包类型分发到 ACK 处理或 Beacon 时间同步处理。
+void ImuSlaveApp::onMpuDataReadyFromIsr() {
+  lastDataReadyLocalUs_ = micros();
+  BaseType_t higherPriorityTaskWoken = pdFALSE;
+  if (sensorTaskHandle_ != nullptr) {
+    vTaskNotifyGiveFromISR(sensorTaskHandle_, &higherPriorityTaskWoken);
+  }
+  if (higherPriorityTaskWoken == pdTRUE) {
+    portYIELD_FROM_ISR();
+  }
+}
+
+// 根据下行包类型分发到 ACK、双向同步或 Beacon 时间同步处理。
 void ImuSlaveApp::onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
-  // Slave 接收三类下行包：COMMAND 切状态，ACK 释放缓存，Beacon 建立时钟模型。
+  // Slave 接收四类下行包：COMMAND 切状态，ACK 释放缓存，SYNC_REPLY 校正时钟，Beacon 建立兜底模型。
+  const uint32_t localRecvUs = micros();
   if (data == nullptr) {
     return;
   }
@@ -89,6 +112,11 @@ void ImuSlaveApp::onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len)
 
   if (len == static_cast<int>(capture::IMU_ACK_WIRE_SIZE) && data[0] == capture::MSG_TYPE_IMU_ACK) {
     handleAckPacket(data, len);
+    return;
+  }
+
+  if (len == static_cast<int>(capture::SYNC_REPLY_WIRE_SIZE) && data[0] == capture::MSG_TYPE_SYNC_REPLY) {
+    handleSyncReply(data, len, localRecvUs);
     return;
   }
 
@@ -125,7 +153,7 @@ bool ImuSlaveApp::loadClockModel(double &slope, double &intercept) {
   return valid;
 }
 
-// 读取 STREAM 启动瞬间冻结的采样时间模型，避免采集中低频 Beacon 造成时间戳跳变。
+// 兼容旧接口；采样时间戳实际使用动态平滑时钟模型。
 bool ImuSlaveApp::loadSampleClockModel(double &slope, double &intercept) {
   bool valid = false;
   portENTER_CRITICAL(&offsetMux_);
@@ -160,8 +188,10 @@ void ImuSlaveApp::handleBeacon(const uint8_t *mac, const uint8_t *data, int len)
   }
 
   const uint32_t localNowUs = micros();
+  const uint32_t nowMs = millis();
   portENTER_CRITICAL(&offsetMux_);
-  if (state_ == capture::STATE_SYNC || state_ == capture::STATE_STREAM_PENDING || state_ == capture::STATE_STREAM) {
+  if ((state_ == capture::STATE_SYNC || state_ == capture::STATE_STREAM_PENDING || state_ == capture::STATE_STREAM) &&
+      (lastTwoWaySyncMs_ == 0 || static_cast<uint32_t>(nowMs - lastTwoWaySyncMs_) > TWO_WAY_BEACON_SUPPRESS_MS)) {
     recordBeaconLocked(localNowUs, packet.masterTimeUs, packet.beaconSeq);
   }
   if (mac != nullptr) {
@@ -179,6 +209,36 @@ void ImuSlaveApp::handleCommandPacket(const uint8_t *data, int len) {
   applyState(command.targetState, command.commandSeq, command.effectiveMasterTimeUs);
 }
 
+void ImuSlaveApp::handleSyncReply(const uint8_t *data, int len, uint32_t localRecvUs) {
+  capture::SyncReplyPacket reply{};
+  if (!capture::decodeSyncReplyPacket(data, len, reply) || reply.source != config_.nodeSource) {
+    return;
+  }
+
+  const uint32_t rttUs = static_cast<uint32_t>(localRecvUs - reply.slaveT1LocalUs);
+  if (rttUs == 0 || rttUs > TWO_WAY_SYNC_RTT_MAX_US) {
+    portENTER_CRITICAL(&offsetMux_);
+    ++syncProbeDrops_;
+    portEXIT_CRITICAL(&offsetMux_);
+    return;
+  }
+
+  const int64_t t2MinusT1 = static_cast<int32_t>(reply.masterT2RecvUs - reply.slaveT1LocalUs);
+  const int64_t t3MinusT4 = static_cast<int32_t>(reply.masterT3SendUs - localRecvUs);
+  const int64_t offsetUs = (t2MinusT1 + t3MinusT4) / 2;
+  const uint32_t localMidUs = reply.slaveT1LocalUs + rttUs / 2U;
+  const uint32_t masterMidUs = static_cast<uint32_t>(static_cast<int64_t>(localMidUs) + offsetUs);
+
+  portENTER_CRITICAL(&offsetMux_);
+  if (state_ == capture::STATE_SYNC || state_ == capture::STATE_STREAM_PENDING || state_ == capture::STATE_STREAM) {
+    recordSyncPointLocked(localMidUs, masterMidUs, reply.probeSeq);
+    lastTwoWaySyncMs_ = millis();
+    lastSyncProbeRttUs_ = rttUs;
+    ++syncProbeReplies_;
+  }
+  portEXIT_CRITICAL(&offsetMux_);
+}
+
 uint8_t ImuSlaveApp::currentState() const {
   return state_;
 }
@@ -191,6 +251,8 @@ void ImuSlaveApp::resetRingLocked() {
   oldestUnackedSeq_ = 0;
   nextSampleSeq_ = 0;
   ringOverflows_ = 0;
+  lastSampleTimestampUs_ = 0;
+  hasLastSampleTimestamp_ = false;
   linkFaultPending_ = false;
   ackPackets_ = 0;
   ackedBatches_ = 0;
@@ -211,7 +273,13 @@ void ImuSlaveApp::resetSyncFitLocked() {
   syncPointCount_ = 0;
   syncPointHead_ = 0;
   lastBeaconSeq_ = 0;
+  syncProbeSeq_ = 0;
   lastSyncDiagMs_ = 0;
+  lastSyncProbeMs_ = 0;
+  lastTwoWaySyncMs_ = 0;
+  syncProbeReplies_ = 0;
+  syncProbeDrops_ = 0;
+  lastSyncProbeRttUs_ = 0;
 }
 
 void ImuSlaveApp::applyState(uint8_t newState, uint16_t commandSeq, uint32_t effectiveMasterTimeUs) {
@@ -261,13 +329,17 @@ void ImuSlaveApp::sendStateAck(uint16_t commandSeq, uint32_t effectiveMasterTime
   esp_now_send(masterMac, packet, sizeof(packet));
 }
 
-void ImuSlaveApp::recordBeaconLocked(uint32_t localRecvUs, uint32_t masterTimeUs, uint16_t beaconSeq) {
-  syncPoints_[syncPointHead_] = {localRecvUs, masterTimeUs};
+void ImuSlaveApp::recordSyncPointLocked(uint32_t localUs, uint32_t masterUs, uint16_t beaconSeq) {
+  syncPoints_[syncPointHead_] = {localUs, masterUs};
   syncPointHead_ = static_cast<uint8_t>((syncPointHead_ + 1U) % SYNC_WINDOW_CAPACITY);
   if (syncPointCount_ < SYNC_WINDOW_CAPACITY) {
     ++syncPointCount_;
   }
   lastBeaconSeq_ = beaconSeq;
+}
+
+void ImuSlaveApp::recordBeaconLocked(uint32_t localRecvUs, uint32_t masterTimeUs, uint16_t beaconSeq) {
+  recordSyncPointLocked(localRecvUs, masterTimeUs, beaconSeq);
 }
 
 // 对当前同步窗口做普通最小二乘拟合；includeMask 非空时只使用 mask 选中的点。
@@ -426,17 +498,9 @@ void ImuSlaveApp::updateClockFitLocked() {
   clockModelValid_ = true;
 }
 
-// 在统一 STREAM 起点冻结一份采样时间模型；后续调度模型可继续随 Beacon 微调。
+// 采样时间戳使用动态平滑模型；保留该函数只兼容 STREAM 进入流程。
 void ImuSlaveApp::freezeSampleClockLocked() {
-  if (clockModelValid_) {
-    sampleClockSlope_ = clockSlope_;
-    sampleClockIntercept_ = clockIntercept_;
-    sampleClockModelValid_ = true;
-  } else {
-    sampleClockSlope_ = 1.0;
-    sampleClockIntercept_ = 0.0;
-    sampleClockModelValid_ = false;
-  }
+  sampleClockModelValid_ = false;
 }
 
 uint32_t ImuSlaveApp::localToMasterTimeUs(uint32_t localUs) {
@@ -449,12 +513,33 @@ uint32_t ImuSlaveApp::localToMasterTimeUs(uint32_t localUs) {
 }
 
 uint32_t ImuSlaveApp::localToSampleTimeUs(uint32_t localUs) {
-  double slope = 1.0;
-  double intercept = 0.0;
-  if (!loadSampleClockModel(slope, intercept)) {
-    return localToMasterTimeUs(localUs);
+  return localToMasterTimeUs(localUs);
+}
+
+void ImuSlaveApp::sendSyncProbe() {
+  uint8_t masterMac[6] = {0};
+  if (!loadMasterMac(masterMac)) {
+    return;
   }
-  return static_cast<uint32_t>(slope * static_cast<double>(localUs) + intercept);
+  if (!esp_now_is_peer_exist(masterMac)) {
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, masterMac, 6);
+    peerInfo.channel = capture::ESPNOW_CHANNEL;
+    peerInfo.encrypt = false;
+    peerInfo.ifidx = WIFI_IF_STA;
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      return;
+    }
+  }
+
+  uint16_t probeSeq = 0;
+  portENTER_CRITICAL(&offsetMux_);
+  probeSeq = syncProbeSeq_++;
+  portEXIT_CRITICAL(&offsetMux_);
+
+  uint8_t packet[capture::SYNC_PROBE_WIRE_SIZE] = {};
+  capture::buildSyncProbePacket(config_.nodeSource, probeSeq, micros(), packet);
+  esp_now_send(masterMac, packet, sizeof(packet));
 }
 
 void ImuSlaveApp::sendSyncDiag() {
@@ -657,7 +742,14 @@ void ImuSlaveApp::wirelessTask() {
     }
 
     const uint8_t state = currentState();
-    if (static_cast<uint32_t>(millis() - lastSyncDiagMs_) >= SYNC_DIAG_INTERVAL_MS) {
+    const uint32_t nowMs = millis();
+    if ((state == capture::STATE_SYNC || state == capture::STATE_STREAM_PENDING || state == capture::STATE_STREAM) &&
+        static_cast<uint32_t>(nowMs - lastSyncProbeMs_) >= SYNC_PROBE_INTERVAL_MS) {
+      sendSyncProbe();
+      lastSyncProbeMs_ = nowMs;
+    }
+
+    if (static_cast<uint32_t>(nowMs - lastSyncDiagMs_) >= SYNC_DIAG_INTERVAL_MS) {
       if (state == capture::STATE_SYNC || state == capture::STATE_STREAM_PENDING) {
         sendSyncDiag();
       } else if (state == capture::STATE_STREAM) {
@@ -716,7 +808,8 @@ void ImuSlaveApp::wirelessTask() {
 
 // 以 1kHz 采样 MPU6500，按 IMU_BATCH_SIZE 组包后写入本地 ring。
 void ImuSlaveApp::sensorTask() {
-  // 1kHz 软件定时采样。无线拥塞不会阻塞这里，只会让 ring 逐渐积压。
+  // 默认 1kHz 软件定时采样；配置 DATA_RDY 引脚后改为 MPU6500 硬件中断定时。
+  sensorTaskHandle_ = xTaskGetCurrentTaskHandle();
   uint32_t nextSampleUs = micros();
 
   capture::ImuRawSample batchSamples[capture::IMU_BATCH_SIZE] = {};
@@ -729,6 +822,9 @@ void ImuSlaveApp::sensorTask() {
         batchCount = 0;
       }
       wasStreaming = false;
+      if (dataReadyInterruptEnabled_) {
+        ulTaskNotifyTake(pdTRUE, 0);
+      }
       vTaskDelay(pdMS_TO_TICKS(2));
       nextSampleUs = micros();
       continue;
@@ -740,15 +836,33 @@ void ImuSlaveApp::sensorTask() {
       wasStreaming = true;
     }
 
-    while (static_cast<int32_t>(micros() - nextSampleUs) < 0) {
-      taskYIELD();
+    uint32_t localTimeUs = 0;
+    if (dataReadyInterruptEnabled_) {
+      if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20)) == 0) {
+        noteDroppedSamples(static_cast<uint32_t>(batchCount) + 1U);
+        batchCount = 0;
+        continue;
+      }
+      localTimeUs = lastDataReadyLocalUs_;
+    } else {
+      while (static_cast<int32_t>(micros() - nextSampleUs) < 0) {
+        taskYIELD();
+      }
+      nextSampleUs += SAMPLE_PERIOD_US;
+      localTimeUs = micros();
     }
-    nextSampleUs += SAMPLE_PERIOD_US;
 
-    const uint32_t localTimeUs = micros();
+    uint32_t sampleTimeUs = localToSampleTimeUs(localTimeUs);
+    portENTER_CRITICAL(&ringMux_);
+    if (hasLastSampleTimestamp_ && static_cast<int32_t>(sampleTimeUs - lastSampleTimestampUs_) <= 0) {
+      sampleTimeUs = lastSampleTimestampUs_ + 1U;
+    }
+    lastSampleTimestampUs_ = sampleTimeUs;
+    hasLastSampleTimestamp_ = true;
+    portEXIT_CRITICAL(&ringMux_);
 
     capture::ImuRawSample sample{};
-    sample.timestampUs = localToSampleTimeUs(localTimeUs);
+    sample.timestampUs = sampleTimeUs;
 
     if (!readSensor(sample)) {
       noteDroppedSamples(static_cast<uint32_t>(batchCount) + 1U);

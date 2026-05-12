@@ -10,7 +10,7 @@ ImuSlaveApp g_app({
     0x02,
     10000,
     ImuSlaveApp::SensorMode::Accel,
-    {{10, 11, 13, 12}, 0x10, 0x18},
+    {{10, 11, 13, 12, -1}, 0x10, 0x18},
     240,
     2000000,
     32,

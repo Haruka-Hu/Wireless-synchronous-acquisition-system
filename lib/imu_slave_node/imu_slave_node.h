@@ -64,15 +64,21 @@ class ImuSlaveApp {
   static constexpr uint8_t SYNC_OUTLIER_REJECT_PERCENT = 20;
   static constexpr double SYNC_OUTLIER_ABS_US = 5000.0;
   static constexpr uint32_t SYNC_DIAG_INTERVAL_MS = 200;
+  static constexpr uint32_t SYNC_PROBE_INTERVAL_MS = 50;
+  static constexpr uint32_t TWO_WAY_SYNC_RTT_MAX_US = 20000;
+  static constexpr uint32_t TWO_WAY_BEACON_SUPPRESS_MS = 1000;
 
   // ESP-NOW/FreeRTOS C 风格回调转发到当前 ImuSlaveApp。
   static void onEspNowSentStatic(const uint8_t *mac, esp_now_send_status_t status);
   static void onEspNowRecvStatic(const uint8_t *mac, const uint8_t *data, int len);
+  static void onMpuDataReadyStatic();
   static void wirelessTaskStatic(void *arg);
   static void sensorTaskStatic(void *arg);
 
   // ESP-NOW 发送完成的实例处理函数。
   void onEspNowSent(esp_now_send_status_t status);
+  // MPU6500 DATA_RDY ISR 的实例处理函数。
+  void onMpuDataReadyFromIsr();
   // ESP-NOW 下行包的实例处理函数。
   void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len);
   // 错峰发送和重传任务主体。
@@ -90,17 +96,20 @@ class ImuSlaveApp {
   // 处理 Master Beacon。
   void handleBeacon(const uint8_t *mac, const uint8_t *data, int len);
   void handleCommandPacket(const uint8_t *data, int len);
+  void handleSyncReply(const uint8_t *data, int len, uint32_t localRecvUs);
   // 处理 Master ACK。
   void handleAckPacket(const uint8_t *data, int len);
   void applyState(uint8_t newState, uint16_t commandSeq, uint32_t effectiveMasterTimeUs);
   void sendStateAck(uint16_t commandSeq, uint32_t effectiveMasterTimeUs);
   void resetRingLocked();
   void resetSyncFitLocked();
+  void recordSyncPointLocked(uint32_t localUs, uint32_t masterUs, uint16_t beaconSeq);
   void recordBeaconLocked(uint32_t localRecvUs, uint32_t masterTimeUs, uint16_t beaconSeq);
   void updateClockFitLocked();
   // 对同步窗口执行一次最小二乘拟合，可选 includeMask 用于第二遍剔除离群点。
   bool fitClockModelLocked(const bool *includeMask, double &slope, double &intercept, double &residualRms);
   void freezeSampleClockLocked();
+  void sendSyncProbe();
   void sendSyncDiag();
   uint32_t localToMasterTimeUs(uint32_t localUs);
   uint32_t localToSampleTimeUs(uint32_t localUs);
@@ -119,6 +128,7 @@ class ImuSlaveApp {
   Config config_;
   Mpu6500Driver mpu_;
   SemaphoreHandle_t sendDoneSem_ = nullptr;
+  TaskHandle_t sensorTaskHandle_ = nullptr;
 
   // offsetMux_ 保护时间同步状态；ringMux_ 保护 batch ring 和样本序号。
   portMUX_TYPE offsetMux_ = portMUX_INITIALIZER_UNLOCKED;
@@ -140,10 +150,18 @@ class ImuSlaveApp {
   uint8_t syncPointCount_ = 0;
   uint8_t syncPointHead_ = 0;
   uint16_t lastBeaconSeq_ = 0;
+  uint16_t syncProbeSeq_ = 0;
   uint32_t lastSyncDiagMs_ = 0;
+  uint32_t lastSyncProbeMs_ = 0;
+  uint32_t lastTwoWaySyncMs_ = 0;
+  uint32_t syncProbeReplies_ = 0;
+  uint32_t syncProbeDrops_ = 0;
+  uint32_t lastSyncProbeRttUs_ = 0;
   uint8_t masterMac_[6] = {0};
   bool hasMasterMac_ = false;
   volatile bool lastSendOk_ = false;
+  volatile uint32_t lastDataReadyLocalUs_ = 0;
+  bool dataReadyInterruptEnabled_ = false;
   BatchSlot batchRing_[BATCH_RING_CAPACITY] = {};
 
   // batchSeq 用于无线 ACK；sampleSeq 用于 PC/MATLAB 检查样本是否连续。
@@ -151,6 +169,8 @@ class ImuSlaveApp {
   uint16_t oldestUnackedSeq_ = 0;
   uint32_t nextSampleSeq_ = 0;
   uint32_t ringOverflows_ = 0;
+  uint32_t lastSampleTimestampUs_ = 0;
+  bool hasLastSampleTimestamp_ = false;
 
   // 一旦出现丢样或缓存溢出，下一包会带 IMU_FLAG_LINK_FAULT，CSV 可据此标记实验段无效。
   bool linkFaultPending_ = false;

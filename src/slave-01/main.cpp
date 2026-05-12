@@ -10,7 +10,7 @@ ImuSlaveApp g_app({
     0x01,
     2000,
     ImuSlaveApp::SensorMode::Gyro,
-    {{10, 11, 13, 12}, 0x18, 0x10},
+    {{10, 11, 13, 12, -1}, 0x18, 0x10},
     240,
     2000000,
     32,

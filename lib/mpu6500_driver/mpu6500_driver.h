@@ -14,6 +14,7 @@ class Mpu6500Driver {
     uint8_t mosi;
     uint8_t miso;
     uint8_t sck;
+    int8_t intPin;
   };
 
   // gyroConfig/accelConfig 直接对应 MPU6500 量程寄存器值。
@@ -32,6 +33,9 @@ class Mpu6500Driver {
   bool readGyro(int16_t &gx, int16_t &gy, int16_t &gz);
   // 读取三轴加速度原始值。
   bool readAccel(int16_t &ax, int16_t &ay, int16_t &az);
+  // INT/DATA_RDY 引脚是可选接线；未配置时采样任务继续使用软件定时。
+  bool hasDataReadyInterrupt() const;
+  int8_t dataReadyInterruptPin() const;
 
  private:
   // 写 MPU6500 单个寄存器。

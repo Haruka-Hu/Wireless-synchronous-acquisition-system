@@ -93,10 +93,12 @@ void MasterApp::onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
   if (data == nullptr || len <= 0 || len > static_cast<int>(capture::IMU_BATCH_WIRE_SIZE)) {
     return;
   }
+  const uint32_t rxTimeUs = micros();
   const uint8_t type = data[0];
   if (type != capture::MSG_TYPE_IMU_BATCH &&
       type != capture::MSG_TYPE_SYNC_DIAG &&
-      type != capture::MSG_TYPE_STATE_ACK) {
+      type != capture::MSG_TYPE_STATE_ACK &&
+      type != capture::MSG_TYPE_SYNC_PROBE) {
     return;
   }
 
@@ -105,6 +107,7 @@ void MasterApp::onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
     memcpy(item.mac, mac, 6);
   }
   item.len = static_cast<uint8_t>(len);
+  item.rxTimeUs = rxTimeUs;
   memcpy(item.bytes, data, len);
 
   if (slaveRxQueue_ != nullptr) {
@@ -596,6 +599,27 @@ void MasterApp::broadcastBeacon(uint32_t nowUs) {
   esp_now_send(broadcastMac_, reinterpret_cast<const uint8_t *>(&beacon), sizeof(beacon));
 }
 
+void MasterApp::handleSyncProbe(const SlaveRxItem &item) {
+  capture::SyncProbePacket probe{};
+  if (!capture::decodeSyncProbePacket(item.bytes, item.len, probe)) {
+    return;
+  }
+  if (!ensureEspNowPeer(item.mac)) {
+    return;
+  }
+
+  capture::SyncReplyPacket reply{};
+  reply.source = probe.source;
+  reply.probeSeq = probe.probeSeq;
+  reply.slaveT1LocalUs = probe.slaveT1LocalUs;
+  reply.masterT2RecvUs = item.rxTimeUs;
+  reply.masterT3SendUs = micros();
+
+  uint8_t packet[capture::SYNC_REPLY_WIRE_SIZE] = {};
+  capture::buildSyncReplyPacket(reply, packet);
+  esp_now_send(item.mac, packet, sizeof(packet));
+}
+
 // 从 serialQueue_ 取样本并合批编码为 USB CDC 帧。
 void MasterApp::serialTxTask() {
   // 小窗口合批发送，减少 USB CDC 包头开销，同时保持毫秒级刷新。
@@ -675,6 +699,11 @@ void MasterApp::wirelessTask() {
 
     while (xQueueReceive(slaveRxQueue_, &rxItem, 0) == pdTRUE) {
       if (rxItem.len == 0) {
+        continue;
+      }
+
+      if (rxItem.bytes[0] == capture::MSG_TYPE_SYNC_PROBE) {
+        handleSyncProbe(rxItem);
         continue;
       }
 

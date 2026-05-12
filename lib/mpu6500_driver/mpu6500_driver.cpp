@@ -9,6 +9,7 @@ constexpr uint8_t REG_CONFIG = 0x1A;
 constexpr uint8_t REG_GYRO_CONFIG = 0x1B;
 constexpr uint8_t REG_ACCEL_CONFIG = 0x1C;
 constexpr uint8_t REG_ACCEL_CONFIG2 = 0x1D;
+constexpr uint8_t REG_INT_ENABLE = 0x38;
 constexpr uint8_t REG_WHO_AM_I = 0x75;
 constexpr uint8_t REG_ACCEL_XOUT_H = 0x3B;
 constexpr uint8_t REG_GYRO_XOUT_H = 0x43;
@@ -38,6 +39,10 @@ bool Mpu6500Driver::begin() {
   writeReg(REG_GYRO_CONFIG, config_.gyroConfig);
   writeReg(REG_ACCEL_CONFIG, config_.accelConfig);
   writeReg(REG_ACCEL_CONFIG2, 0x01);
+  if (hasDataReadyInterrupt()) {
+    pinMode(config_.pins.intPin, INPUT);
+    writeReg(REG_INT_ENABLE, 0x01);
+  }
 
   // WHO_AM_I 只做基本连通性检查：0x00/0xFF 通常表示 SPI 断线或 CS 错误。
   const uint8_t whoAmI = readReg(REG_WHO_AM_I);
@@ -66,6 +71,14 @@ bool Mpu6500Driver::readAccel(int16_t &ax, int16_t &ay, int16_t &az) {
   ay = static_cast<int16_t>((static_cast<uint16_t>(raw[2]) << 8) | raw[3]);
   az = static_cast<int16_t>((static_cast<uint16_t>(raw[4]) << 8) | raw[5]);
   return true;
+}
+
+bool Mpu6500Driver::hasDataReadyInterrupt() const {
+  return config_.pins.intPin >= 0;
+}
+
+int8_t Mpu6500Driver::dataReadyInterruptPin() const {
+  return config_.pins.intPin;
 }
 
 // 通过 SPI 写 MPU6500 单个寄存器。

@@ -292,6 +292,63 @@ bool decodeStateAckPacket(const uint8_t *data, int len, StateAckPacket &outAck) 
   return outAck.state <= STATE_STREAM;
 }
 
+void buildSyncProbePacket(uint8_t source,
+                          uint16_t probeSeq,
+                          uint32_t slaveT1LocalUs,
+                          uint8_t outBytes[SYNC_PROBE_WIRE_SIZE]) {
+  memset(outBytes, 0, SYNC_PROBE_WIRE_SIZE);
+  outBytes[0] = MSG_TYPE_SYNC_PROBE;
+  outBytes[1] = source;
+  encodeU16LE(&outBytes[2], probeSeq);
+  encodeU32LE(&outBytes[4], slaveT1LocalUs);
+  const uint16_t crc = crc16Ccitt(outBytes, SYNC_PROBE_WIRE_SIZE - 2);
+  encodeU16LE(&outBytes[SYNC_PROBE_WIRE_SIZE - 2], crc);
+}
+
+bool decodeSyncProbePacket(const uint8_t *data, int len, SyncProbePacket &outProbe) {
+  if (data == nullptr || len != static_cast<int>(SYNC_PROBE_WIRE_SIZE) || data[0] != MSG_TYPE_SYNC_PROBE) {
+    return false;
+  }
+  const uint16_t receivedCrc = decodeU16LE(&data[SYNC_PROBE_WIRE_SIZE - 2]);
+  const uint16_t calculatedCrc = crc16Ccitt(data, SYNC_PROBE_WIRE_SIZE - 2);
+  if (receivedCrc != calculatedCrc) {
+    return false;
+  }
+  outProbe.source = data[1];
+  outProbe.probeSeq = decodeU16LE(&data[2]);
+  outProbe.slaveT1LocalUs = decodeU32LE(&data[4]);
+  return outProbe.source >= SLAVE_SOURCE_MIN && outProbe.source <= SLAVE_SOURCE_MAX;
+}
+
+void buildSyncReplyPacket(const SyncReplyPacket &reply, uint8_t outBytes[SYNC_REPLY_WIRE_SIZE]) {
+  memset(outBytes, 0, SYNC_REPLY_WIRE_SIZE);
+  outBytes[0] = MSG_TYPE_SYNC_REPLY;
+  outBytes[1] = reply.source;
+  encodeU16LE(&outBytes[2], reply.probeSeq);
+  encodeU32LE(&outBytes[4], reply.slaveT1LocalUs);
+  encodeU32LE(&outBytes[8], reply.masterT2RecvUs);
+  encodeU32LE(&outBytes[12], reply.masterT3SendUs);
+  const uint16_t crc = crc16Ccitt(outBytes, SYNC_REPLY_WIRE_SIZE - 2);
+  encodeU16LE(&outBytes[SYNC_REPLY_WIRE_SIZE - 2], crc);
+}
+
+bool decodeSyncReplyPacket(const uint8_t *data, int len, SyncReplyPacket &outReply) {
+  if (data == nullptr || len != static_cast<int>(SYNC_REPLY_WIRE_SIZE) || data[0] != MSG_TYPE_SYNC_REPLY) {
+    return false;
+  }
+  const uint16_t receivedCrc = decodeU16LE(&data[SYNC_REPLY_WIRE_SIZE - 2]);
+  const uint16_t calculatedCrc = crc16Ccitt(data, SYNC_REPLY_WIRE_SIZE - 2);
+  if (receivedCrc != calculatedCrc) {
+    return false;
+  }
+  outReply.source = data[1];
+  outReply.probeSeq = decodeU16LE(&data[2]);
+  outReply.slaveT1LocalUs = decodeU32LE(&data[4]);
+  outReply.masterT2RecvUs = decodeU32LE(&data[8]);
+  outReply.masterT3SendUs = decodeU32LE(&data[12]);
+  return outReply.source >= SLAVE_SOURCE_MIN && outReply.source <= SLAVE_SOURCE_MAX;
+}
+
 void buildSyncDiagPacket(const SyncDiagPacket &diag, uint8_t outBytes[SYNC_DIAG_WIRE_SIZE]) {
   memset(outBytes, 0, SYNC_DIAG_WIRE_SIZE);
   outBytes[0] = MSG_TYPE_SYNC_DIAG;
