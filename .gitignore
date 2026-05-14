@@ -42,4 +42,4 @@ src_past/
 pixi.toml
 pixi.lock
 platformio.ini
-
+outputs/
