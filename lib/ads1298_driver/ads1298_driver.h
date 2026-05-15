@@ -25,7 +25,9 @@ class Ads1298Driver {
   // begin 会完成芯片复位、寄存器配置，并把 DRDY ISR 绑定到引脚。
   void begin(void (*drdyIsr)());
   // 读取一次完整转换结果，仅返回本项目需要的 CH6/CH7/CH8。
-  bool readChannels(int32_t &ch6, int32_t &ch7, int32_t &ch8);
+  //bool readChannels(int32_t &ch6, int32_t &ch7, int32_t &ch8);
+  // 读取一次完整转换结果，返回所有 8 个通道的数据。
+  bool readChannels(int32_t channels[8]);
 
  private:
   // 发送 ADS1298 单字节命令。

@@ -32,15 +32,19 @@ void Ads1298Driver::begin(void (*drdyIsr)()) {
   writeReg(0x03, 0xCC);
   writeReg(0x01, 0x84);
 
-  for (int i = 0; i < 5; ++i) {
-    writeReg(static_cast<uint8_t>(0x05 + i), 0x81);
+  // for (int i = 0; i < 5; ++i) {
+  //   writeReg(static_cast<uint8_t>(0x05 + i), 0x81);
+  // }
+  // writeReg(0x0A, 0x60);
+  // writeReg(0x0B, 0x60);
+  // writeReg(0x0C, 0x60);
+  // 配置所有 8 个通道为正常运行，增益设置为 12（0x60），普通电极输入
+  for (int i = 0; i < 8; ++i) {
+    writeReg(static_cast<uint8_t>(0x05 + i), 0x60);
   }
-  writeReg(0x0A, 0x60);
-  writeReg(0x0B, 0x60);
-  writeReg(0x0C, 0x60);
 
-  writeReg(0x0D, 0xE0);
-  writeReg(0x0E, 0xE0);
+  writeReg(0x0D, 0x80); // RLD_SENSP: 仅选中 CH8 的正极 (膝盖骨)
+  writeReg(0x0E, 0x80); // RLD_SENSN: 仅选中 CH8 的负极 (腰部 REF)
   writeReg(0x00, 0x00);
 
   sendCmd(0x08);
@@ -51,24 +55,45 @@ void Ads1298Driver::begin(void (*drdyIsr)()) {
 }
 
 // 读取一次 ADS1298 转换帧，并返回本项目使用的 CH6/CH7/CH8 原始值。
-bool Ads1298Driver::readChannels(int32_t &ch6, int32_t &ch7, int32_t &ch8) {
-  // RDATA 帧为 3 字节状态 + 8 路 24-bit 通道，本项目只使用最后三路。
+// bool Ads1298Driver::readChannels(int32_t &ch6, int32_t &ch7, int32_t &ch8) {
+//   // RDATA 帧为 3 字节状态 + 8 路 24-bit 通道，本项目只使用最后三路。
+//   uint8_t rx[27] = {0};
+//   SPI.beginTransaction(ADS_SPI_SETTINGS);
+//   digitalWrite(pins_.cs, LOW);
+//   SPI.transferBytes(nullptr, rx, sizeof(rx));
+//   digitalWrite(pins_.cs, HIGH);
+//   SPI.endTransaction();
+
+//   ch6 = signExtend24((static_cast<uint32_t>(rx[18]) << 16) |
+//                      (static_cast<uint32_t>(rx[19]) << 8) |
+//                      static_cast<uint32_t>(rx[20]));
+//   ch7 = signExtend24((static_cast<uint32_t>(rx[21]) << 16) |
+//                      (static_cast<uint32_t>(rx[22]) << 8) |
+//                      static_cast<uint32_t>(rx[23]));
+//   ch8 = signExtend24((static_cast<uint32_t>(rx[24]) << 16) |
+//                      (static_cast<uint32_t>(rx[25]) << 8) |
+//                      static_cast<uint32_t>(rx[26]));
+//   return true;
+// }
+// 读取一次 ADS1298 转换帧，提取全部 8 个通道的原始值
+bool Ads1298Driver::readChannels(int32_t channels[8]) {
+  // RDATA 帧总长 27 字节：3 字节状态头 + 8 路 * 3 字节 (24-bit)
   uint8_t rx[27] = {0};
+  
   SPI.beginTransaction(ADS_SPI_SETTINGS);
   digitalWrite(pins_.cs, LOW);
   SPI.transferBytes(nullptr, rx, sizeof(rx));
   digitalWrite(pins_.cs, HIGH);
   SPI.endTransaction();
 
-  ch6 = signExtend24((static_cast<uint32_t>(rx[18]) << 16) |
-                     (static_cast<uint32_t>(rx[19]) << 8) |
-                     static_cast<uint32_t>(rx[20]));
-  ch7 = signExtend24((static_cast<uint32_t>(rx[21]) << 16) |
-                     (static_cast<uint32_t>(rx[22]) << 8) |
-                     static_cast<uint32_t>(rx[23]));
-  ch8 = signExtend24((static_cast<uint32_t>(rx[24]) << 16) |
-                     (static_cast<uint32_t>(rx[25]) << 8) |
-                     static_cast<uint32_t>(rx[26]));
+  // 循环提取 8 个通道 (CH1 ~ CH8)
+  // 通道数据从索引 3 开始，每个通道占 3 个字节
+  for (int i = 0; i < 8; ++i) {
+    channels[i] = signExtend24((static_cast<uint32_t>(rx[3 + i * 3]) << 16) |
+                               (static_cast<uint32_t>(rx[4 + i * 3]) << 8) |
+                               static_cast<uint32_t>(rx[5 + i * 3]));
+  }
+  
   return true;
 }
 

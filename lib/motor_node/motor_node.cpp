@@ -50,11 +50,12 @@ void MotorApp::begin() {
   Serial.println();
   Serial.println("Neuro Hammer motor node starting...");
 
-  // 【新增】初始化时将硬编码的默认参数加载到动态字典中
+  // 初始化时将硬编码的默认参数加载到动态字典中
   for (uint8_t i = 0; i < config_.strikeProfileCount; ++i) {
     strikeProfiles_[i + 1] = config_.strikeProfiles[i];
   }
 
+  // BLE 写入先进入命令队列，loopOnce 再处理，保证 UI 连续写命令时不会卡住 BLE 回调。
   commandQueue_ = xQueueCreate(12, sizeof(MotorCommand));
   motor_.begin();
   stopMotor();
@@ -83,15 +84,23 @@ void MotorApp::enqueueCommandStatic(const MotorCommand &command) {
 
 // 把上位机文本命令解析成内部命令枚举和档位号。
 MotorApp::MotorCommand MotorApp::parseCommand(String raw) {
+  // 上位机命令按行传输，固件端统一忽略大小写和首尾空白。
   raw.trim();
   raw.toUpperCase();
 
-  if (raw == "PING") return {CommandType::Ping, 0, {}};
-  if (raw == "STOP") return {CommandType::Stop, 0, {}};
-  if (raw == "MOTOR_FWD") return {CommandType::ManualForward, 0, {}};
-  if (raw == "MOTOR_REV") return {CommandType::ManualReverse, 0, {}};
-
-  // 匹配原有触发指令：STRIKE_X (解除1~5档的限制，允许任意档位)
+  if (raw == "PING") {
+    return {CommandType::Ping, 0, {}};
+  }
+  if (raw == "STOP") {
+    return {CommandType::Stop, 0, {}};
+  }
+  if (raw == "MOTOR_FWD") {
+    return {CommandType::ManualForward, 0, {}};
+  }
+  if (raw == "MOTOR_REV") {
+    return {CommandType::ManualReverse, 0, {}};
+  }
+  
   if (raw.startsWith("STRIKE_")) {
     const int gear = raw.substring(7).toInt();
     if (gear > 0) {
@@ -99,17 +108,14 @@ MotorApp::MotorCommand MotorApp::parseCommand(String raw) {
     }
   }
 
-  // 【新增】匹配设置指令：SET_STRIKE <档位> <回撤PWM> <回撤毫秒> <敲击PWM> <敲击毫秒>
   if (raw.startsWith("SET_STRIKE ")) {
     int gear, pullPwm, strikePwm;
     uint32_t pullMs, strikeMs;
-    // 使用 sscanf 提取5个参数
     if (sscanf(raw.c_str(), "SET_STRIKE %d %d %u %d %u", &gear, &pullPwm, &pullMs, &strikePwm, &strikeMs) == 5) {
       return {CommandType::SetStrike, static_cast<uint8_t>(gear), {pullPwm, pullMs, strikePwm, strikeMs}};
     }
   }
 
-  // 【新增】匹配删除指令：DEL_STRIKE <档位>
   if (raw.startsWith("DEL_STRIKE ")) {
     int gear;
     if (sscanf(raw.c_str(), "DEL_STRIKE %d", &gear) == 1) {
@@ -118,49 +124,6 @@ MotorApp::MotorCommand MotorApp::parseCommand(String raw) {
   }
 
   return {CommandType::Unknown, 0, {}};
-}
-
-void MotorApp::handleCommand(const MotorCommand &command) {
-  switch (command.type) {
-    case CommandType::Ping:
-      notifyHost("ACK: PONG");
-      break;
-    case CommandType::Stop:
-      stopMotor();
-      notifyHost("ACK: STOP");
-      break;
-    case CommandType::Strike:
-      // 【修改】改为在 map 中查询该档位是否存在
-      if (strikeProfiles_.find(command.gear) == strikeProfiles_.end()) {
-        notifyHost("ERR: INVALID_GEAR");
-      } else {
-        beginStrike(command.gear);
-      }
-      break;
-    case CommandType::SetStrike:
-      // 【新增】写入/覆盖档位参数
-      strikeProfiles_[command.gear] = command.profile;
-      notifyHost("ACK: SET_STRIKE_" + String(command.gear));
-      break;
-    case CommandType::DelStrike:
-      // 【新增】删除档位参数
-      if (strikeProfiles_.erase(command.gear)) {
-        notifyHost("ACK: DEL_STRIKE_" + String(command.gear));
-      } else {
-        notifyHost("ERR: GEAR_NOT_FOUND");
-      }
-      break;
-    case CommandType::ManualForward:
-      beginManualForward();
-      break;
-    case CommandType::ManualReverse:
-      beginManualReverse();
-      break;
-    case CommandType::Unknown:
-    default:
-      notifyHost("ERR: UNKNOWN_COMMAND");
-      break;
-  }
 }
 
 // 创建 Nordic UART 风格 BLE 服务，并开始广播设备名。
@@ -227,7 +190,6 @@ void MotorApp::stopMotor() {
 
 // 启动指定档位的一次完整叩击，先进入回撤阶段。
 void MotorApp::beginStrike(uint8_t gear) {
-  // 【修改】从 map 获取参数
   auto it = strikeProfiles_.find(gear);
   if (it == strikeProfiles_.end()) return;
   const StrikeProfile &profile = it->second;
@@ -237,35 +199,6 @@ void MotorApp::beginStrike(uint8_t gear) {
   phaseDeadlineMs_ = millis() + profile.pullMs;
   motor_.driveReverse(profile.pullPwm);
   notifyHost("ACK: STRIKE_" + String(gear));
-}
-
-void MotorApp::updateMotorState() {
-  if (mode_ != MotorMode::StrikePull && mode_ != MotorMode::StrikeFire) {
-    return;
-  }
-
-  if (static_cast<int32_t>(millis() - phaseDeadlineMs_) < 0) {
-    return;
-  }
-
-  // 【修改】从 map 获取当前档位参数
-  auto it = strikeProfiles_.find(activeGear_);
-  if (it == strikeProfiles_.end()) {
-    stopMotor(); // 防御性处理：执行途中档位被意外删除时停机
-    return;
-  }
-  const StrikeProfile &profile = it->second;
-
-  if (mode_ == MotorMode::StrikePull) {
-    mode_ = MotorMode::StrikeFire;
-    phaseDeadlineMs_ = millis() + profile.strikeMs;
-    motor_.driveForward(profile.strikePwm);
-    return;
-  }
-
-  const uint8_t finishedGear = activeGear_;
-  stopMotor();
-  notifyHost("ACK: STRIKE_DONE_" + String(finishedGear));
 }
 
 // 进入固定 PWM 正转模式，直到收到 STOP 或 BLE 断开。
@@ -297,10 +230,21 @@ void MotorApp::handleCommand(const MotorCommand &command) {
       notifyHost("ACK: STOP");
       break;
     case CommandType::Strike:
-      if (command.gear < 1 || command.gear > config_.strikeProfileCount) {
+      if (strikeProfiles_.find(command.gear) == strikeProfiles_.end()) {
         notifyHost("ERR: INVALID_GEAR");
       } else {
         beginStrike(command.gear);
+      }
+      break;
+    case CommandType::SetStrike:
+      strikeProfiles_[command.gear] = command.profile;
+      notifyHost("ACK: SET_STRIKE_" + String(command.gear));
+      break;
+    case CommandType::DelStrike:
+      if (strikeProfiles_.erase(command.gear)) {
+        notifyHost("ACK: DEL_STRIKE_" + String(command.gear));
+      } else {
+        notifyHost("ERR: GEAR_NOT_FOUND");
       }
       break;
     case CommandType::ManualForward:
@@ -327,7 +271,13 @@ void MotorApp::updateMotorState() {
     return;
   }
 
-  const StrikeProfile &profile = config_.strikeProfiles[activeGear_ - 1];
+  auto it = strikeProfiles_.find(activeGear_);
+  if (it == strikeProfiles_.end()) {
+    stopMotor(); // 防御性处理：执行途中档位被意外删除时停机
+    return;
+  }
+  const StrikeProfile &profile = it->second;
+
   if (mode_ == MotorMode::StrikePull) {
     // 回撤时间到后切到正向敲击。
     mode_ = MotorMode::StrikeFire;
