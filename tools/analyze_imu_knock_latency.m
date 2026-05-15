@@ -6,7 +6,7 @@
 clear; clc; close all;
 
 % --- 1. 用户配置区 ---
-filename = 'data/imu_capture_20260513_144911.csv'; % 数据文件名
+filename = 'data/imu_capture_20260514_171235.csv'; % 数据文件名
 gyro_axis = 'z';                              % 展示与计算的角速度轴
 notch_freq = 50;                              % 工频干扰频率 
 min_tap_interval = 1.5;                       % 两次叩击之间的最短间隔(秒)

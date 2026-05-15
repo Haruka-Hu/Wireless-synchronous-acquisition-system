@@ -59,6 +59,8 @@ class MotorApp {
     Strike,
     ManualForward,
     ManualReverse,
+    SetStrike,  // 【新增】设置/更新档位参数
+    DelStrike,  // 【新增】删除档位
     Unknown,
   };
 
@@ -66,6 +68,7 @@ class MotorApp {
   struct MotorCommand {
     CommandType type;
     uint8_t gear;
+    StrikeProfile profile; // 【新增】用于在队列中传递新的参数设定
   };
 
   // 叩击状态机的运行阶段。时间到后自动从回撤切换到敲击，再停止。
@@ -109,4 +112,6 @@ class MotorApp {
   uint8_t activeGear_ = 0;
   // 当前阶段的结束时间，使用 millis() 时间域。
   uint32_t phaseDeadlineMs_ = 0;
+  // 【新增】动态存储档位参数字典 (Key: 档位号, Value: 动作参数)
+  std::map<uint8_t, StrikeProfile> strikeProfiles_;
 };
