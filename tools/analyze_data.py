@@ -86,4 +86,4 @@ def analyze_transmission_stability(csv_file_path):
 
 if __name__ == "__main__":
     # 您可以将文件名替换为您实际要跑的文件
-    analyze_transmission_stability('data/imu_capture_20260514_165411.csv')
+    analyze_transmission_stability('data/imu_capture_20260525_210612.csv')

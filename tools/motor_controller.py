@@ -202,11 +202,11 @@ class MainWindow(QMainWindow):
 
         # 默认档位缓存（与固件初始化状态保持一致）
         self.gear_profiles = {
-            1: {"pull_pwm": 300, "pull_ms": 200, "strike_pwm": 400,  "strike_ms": 150},
-            2: {"pull_pwm": 400, "pull_ms": 200, "strike_pwm": 600,  "strike_ms": 120},
-            3: {"pull_pwm": 400, "pull_ms": 200, "strike_pwm": 800,  "strike_ms": 100},
-            4: {"pull_pwm": 500, "pull_ms": 200, "strike_pwm": 950,  "strike_ms": 80},
-            5: {"pull_pwm": 500, "pull_ms": 200, "strike_pwm": 1023, "strike_ms": 70},
+            1: {"touch_pwm": 200, "touch_ms": 300, "pull_pwm": 400, "pull_ms": 200, "strike_pwm": 500,  "strike_ms": 200},
+            2: {"touch_pwm": 200, "touch_ms": 300, "pull_pwm": 400, "pull_ms": 200, "strike_pwm": 700,  "strike_ms": 200},
+            3: {"touch_pwm": 200, "touch_ms": 300, "pull_pwm": 400, "pull_ms": 200, "strike_pwm": 900,  "strike_ms": 200},
+            4: {"touch_pwm": 200, "touch_ms": 300, "pull_pwm": 400, "pull_ms": 200, "strike_pwm": 1100, "strike_ms": 200},
+            5: {"touch_pwm": 200, "touch_ms": 300, "pull_pwm": 400, "pull_ms": 200, "strike_pwm": 1300, "strike_ms": 200},
         }
 
         self.setWindowTitle("Neuro Hammer Motor Controller (配置版)")
@@ -232,8 +232,8 @@ class MainWindow(QMainWindow):
 
         # ====== 档位参数表格 ======
         self.table = QTableWidget()
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["档位 ID", "回撤 PWM", "回撤 ms", "敲击 PWM", "敲击 ms"])
+        self.table.setColumnCount(7)  # 从 5 修改为 7
+        self.table.setHorizontalHeaderLabels(["档位 ID", "触碰 PWM", "触碰 ms", "回撤 PWM", "回撤 ms", "敲击 PWM", "敲击 ms"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         main_layout.addWidget(self.table)
@@ -302,14 +302,17 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(len(self.gear_profiles))
         for row, (gear_id, p) in enumerate(sorted(self.gear_profiles.items())):
             item_id = QTableWidgetItem(str(gear_id))
-            item_id.setFlags(item_id.flags() & ~Qt.ItemIsEditable) # ID 列不允许手动修改
+            item_id.setFlags(item_id.flags() & ~Qt.ItemIsEditable) 
             item_id.setBackground(Qt.lightGray)
             
             self.table.setItem(row, 0, item_id)
-            self.table.setItem(row, 1, QTableWidgetItem(str(p["pull_pwm"])))
-            self.table.setItem(row, 2, QTableWidgetItem(str(p["pull_ms"])))
-            self.table.setItem(row, 3, QTableWidgetItem(str(p["strike_pwm"])))
-            self.table.setItem(row, 4, QTableWidgetItem(str(p["strike_ms"])))
+            self.table.setItem(row, 1, QTableWidgetItem(str(p["touch_pwm"])))
+            self.table.setItem(row, 2, QTableWidgetItem(str(p["touch_ms"])))
+            self.table.setItem(row, 3, QTableWidgetItem(str(p["pull_pwm"])))
+            self.table.setItem(row, 4, QTableWidgetItem(str(p["pull_ms"])))
+            self.table.setItem(row, 5, QTableWidgetItem(str(p["strike_pwm"])))
+            self.table.setItem(row, 6, QTableWidgetItem(str(p["strike_ms"])))
+        # ... 后面的刷新按钮代码保持不变
 
         # 2. 刷新顶部触发按钮区
         # 先清空原有按钮
@@ -345,19 +348,22 @@ class MainWindow(QMainWindow):
         for row in range(self.table.rowCount()):
             try:
                 g_id = int(self.table.item(row, 0).text())
-                p_pwm = int(self.table.item(row, 1).text())
-                p_ms = int(self.table.item(row, 2).text())
-                s_pwm = int(self.table.item(row, 3).text())
-                s_ms = int(self.table.item(row, 4).text())
+                t_pwm = int(self.table.item(row, 1).text())
+                t_ms = int(self.table.item(row, 2).text())
+                p_pwm = int(self.table.item(row, 3).text())
+                p_ms = int(self.table.item(row, 4).text())
+                s_pwm = int(self.table.item(row, 5).text())
+                s_ms = int(self.table.item(row, 6).text())
                 
                 # 存入本地缓存
                 self.gear_profiles[g_id] = {
+                    "touch_pwm": t_pwm, "touch_ms": t_ms,
                     "pull_pwm": p_pwm, "pull_ms": p_ms,
                     "strike_pwm": s_pwm, "strike_ms": s_ms
                 }
                 
-                # 下发指令到硬件
-                self.send(f"SET_STRIKE {g_id} {p_pwm} {p_ms} {s_pwm} {s_ms}")
+                # 下发指令到硬件 (现在有 6 个参数，加上档位号共 7 个)
+                self.send(f"SET_STRIKE {g_id} {t_pwm} {t_ms} {p_pwm} {p_ms} {s_pwm} {s_ms}")
                 success_count += 1
             except (ValueError, AttributeError):
                 self.append_log("UI", f"警告: 表格第 {row+1} 行数据格式错误，跳过同步。")
@@ -370,8 +376,9 @@ class MainWindow(QMainWindow):
         if self.gear_profiles:
             new_id = max(self.gear_profiles.keys()) + 1
         
-        # 默认参数
+        # 默认参数增加触碰阶段
         self.gear_profiles[new_id] = {
+            "touch_pwm": 200, "touch_ms": 100,
             "pull_pwm": 500, "pull_ms": 200, 
             "strike_pwm": 500, "strike_ms": 100
         }

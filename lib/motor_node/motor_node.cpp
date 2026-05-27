@@ -108,11 +108,15 @@ MotorApp::MotorCommand MotorApp::parseCommand(String raw) {
     }
   }
 
+  // 在 parseCommand 函数中找到 "SET_STRIKE " 的判断分支，替换为以下代码：
   if (raw.startsWith("SET_STRIKE ")) {
-    int gear, pullPwm, strikePwm;
-    uint32_t pullMs, strikeMs;
-    if (sscanf(raw.c_str(), "SET_STRIKE %d %d %u %d %u", &gear, &pullPwm, &pullMs, &strikePwm, &strikeMs) == 5) {
-      return {CommandType::SetStrike, static_cast<uint8_t>(gear), {pullPwm, pullMs, strikePwm, strikeMs}};
+    int gear, touchPwm, pullPwm, strikePwm;
+    uint32_t touchMs, pullMs, strikeMs;
+    // 解析 7 个参数：档位, 触碰PWM, 触碰时间, 回撤PWM, 回撤时间, 敲击PWM, 敲击时间
+    if (sscanf(raw.c_str(), "SET_STRIKE %d %d %u %d %u %d %u", 
+               &gear, &touchPwm, &touchMs, &pullPwm, &pullMs, &strikePwm, &strikeMs) == 7) {
+      return {CommandType::SetStrike, static_cast<uint8_t>(gear), 
+              {touchPwm, touchMs, pullPwm, pullMs, strikePwm, strikeMs}};
     }
   }
 
@@ -187,17 +191,16 @@ void MotorApp::stopMotor() {
   activeGear_ = 0;
   phaseDeadlineMs_ = 0;
 }
-
-// 启动指定档位的一次完整叩击，先进入回撤阶段。
+// 启动指定档位的一次完整叩击，先进入触碰阶段。
 void MotorApp::beginStrike(uint8_t gear) {
   auto it = strikeProfiles_.find(gear);
   if (it == strikeProfiles_.end()) return;
   const StrikeProfile &profile = it->second;
 
-  mode_ = MotorMode::StrikePull;
+  mode_ = MotorMode::StrikeTouch; // 修改起点为触碰状态
   activeGear_ = gear;
-  phaseDeadlineMs_ = millis() + profile.pullMs;
-  motor_.driveReverse(profile.pullPwm);
+  phaseDeadlineMs_ = millis() + profile.touchMs;
+  motor_.driveForward(profile.touchPwm); // 正向小力度转动
   notifyHost("ACK: STRIKE_" + String(gear));
 }
 
@@ -262,8 +265,10 @@ void MotorApp::handleCommand(const MotorCommand &command) {
 
 // 根据 millis() 推进叩击状态机；手动模式不在这里自动退出。
 void MotorApp::updateMotorState() {
-  // 手动正反转不靠定时退出，只能由 STOP 或断开连接停止。
-  if (mode_ != MotorMode::StrikePull && mode_ != MotorMode::StrikeFire) {
+  // 增加 StrikeTouch 的有效性判断
+  if (mode_ != MotorMode::StrikeTouch && 
+      mode_ != MotorMode::StrikePull && 
+      mode_ != MotorMode::StrikeFire) {
     return;
   }
 
@@ -273,13 +278,21 @@ void MotorApp::updateMotorState() {
 
   auto it = strikeProfiles_.find(activeGear_);
   if (it == strikeProfiles_.end()) {
-    stopMotor(); // 防御性处理：执行途中档位被意外删除时停机
+    stopMotor(); 
     return;
   }
   const StrikeProfile &profile = it->second;
 
+  // 新增：触碰时间到后，切到反向回撤
+  if (mode_ == MotorMode::StrikeTouch) {
+    mode_ = MotorMode::StrikePull;
+    phaseDeadlineMs_ = millis() + profile.pullMs;
+    motor_.driveReverse(profile.pullPwm);
+    return;
+  }
+
+  // 原有逻辑：回撤时间到后切到正向敲击。
   if (mode_ == MotorMode::StrikePull) {
-    // 回撤时间到后切到正向敲击。
     mode_ = MotorMode::StrikeFire;
     phaseDeadlineMs_ = millis() + profile.strikeMs;
     motor_.driveForward(profile.strikePwm);
