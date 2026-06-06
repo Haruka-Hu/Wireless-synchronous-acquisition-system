@@ -1,6 +1,8 @@
+from __future__ import annotations
+
+import argparse
+
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
 
 def analyze_transmission_stability(csv_file_path):
     # 1. 加载数据
@@ -56,34 +58,15 @@ def analyze_transmission_stability(csv_file_path):
         print(f"主机接收间隔 (Host RX): 平均 {rx_diff_mean:.2f} ms | 抖动(Std) {rx_jitter_std:.2f} ms")
         print(f"传感器采样间隔 (Sensor TS): 平均 {ts_diff_mean:.2f} ms | 抖动(Std) {ts_jitter_std:.2f} ms\n")
         
-        # --- D. 绘制可视化图表 ---
-        plt.figure(figsize=(12, 4))
-        
-        # 子图 1: 主机端接收抖动
-        plt.subplot(1, 2, 1)
-        plt.plot(rx_diff_ms.values[1:], label='RX Interval (ms)', color='#1f77b4', alpha=0.7)
-        plt.axhline(rx_diff_mean, color='red', linestyle='--', label='Mean Interval')
-        plt.title(f'{source} - Host RX Jitter')
-        plt.xlabel('Sample Index')
-        plt.ylabel('Interval (ms)')
-        plt.legend()
-        
-        # 子图 2: 传感器端采样抖动
-        plt.subplot(1, 2, 2)
-        plt.plot(ts_diff_ms.values[1:], label='Sensor TS Interval (ms)', color='#ff7f0e', alpha=0.7)
-        plt.axhline(ts_diff_mean, color='red', linestyle='--', label='Mean Interval')
-        plt.title(f'{source} - Sensor Timestamp Jitter')
-        plt.xlabel('Sample Index')
-        plt.ylabel('Interval (ms)')
-        plt.legend()
-        
-        plt.tight_layout()
-        plt.savefig(f'{source}_stability_report.png')
-        plt.close()
-        
-    print("分析完成，抖动图表已保存到当前目录。")
+    print("分析完成。")
     return results
 
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="分析采集 CSV 的 sample_seq 丢包和时间抖动。")
+    parser.add_argument("csv_file", help="要分析的 imu_capture_*.csv 文件。")
+    return parser.parse_args()
+
 if __name__ == "__main__":
-    # 您可以将文件名替换为您实际要跑的文件
-    analyze_transmission_stability('data/imu_capture_20260525_210612.csv')
+    args = parse_args()
+    analyze_transmission_stability(args.csv_file)

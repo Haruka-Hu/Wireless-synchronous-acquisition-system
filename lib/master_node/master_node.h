@@ -77,7 +77,7 @@ class MasterApp {
   static constexpr size_t PC_SERIAL_FRAME_QUEUE_SIZE = 16;
   static constexpr size_t PC_SERIAL_RETX_CACHE_SIZE = 64;
   static constexpr uint32_t SLAVE_OFFLINE_TIMEOUT_US = 3000000;
-  static constexpr uint32_t ACK_MIN_INTERVAL_US = 40000;
+  static constexpr uint32_t ACK_MIN_INTERVAL_US = 8000;
 
   // Arduino/ESP-NOW/FreeRTOS 需要 C 风格回调，用静态函数转发到当前 MasterApp 实例。
   static void onAdsDrdyStatic();
@@ -136,6 +136,7 @@ class MasterApp {
   void cachePcSerialFrame(uint8_t sequence, const uint8_t *data, size_t size);
   bool resendPcSerialFrame(uint8_t sequence);
   void handlePcRetransmitCommand(const String &raw);
+  void handlePcRadioCommand(const String &raw);
   // 写入一条诊断帧。
   void writeDiagFrame(uint32_t timestampUs,
                       int32_t forwardedPerSec,
@@ -149,6 +150,8 @@ class MasterApp {
   void handlePcCommand(String raw);
   void transitionTo(uint8_t newState, uint32_t effectiveMasterTimeUs);
   void broadcastCommand(uint8_t targetState, uint32_t effectiveMasterTimeUs);
+  void broadcastRadioConfig(uint8_t channel, uint8_t rateCode);
+  bool applyRadioConfig(uint8_t channel, uint8_t rateCode);
   void broadcastBeacon(uint32_t nowUs);
   void resetStreamingState();
   uint8_t currentState() const;
@@ -180,7 +183,10 @@ class MasterApp {
   uint8_t pcSerialSequence_ = 0;
   uint8_t pcEventSequence_ = 0;
   uint16_t commandSeq_ = 0;
+  uint16_t radioConfigSeq_ = 0;
   uint16_t beaconSeq_ = 0;
+  uint8_t currentChannel_ = capture::ESPNOW_CHANNEL;
+  uint8_t currentRateCode_ = capture::ESPNOW_DEFAULT_RATE;
   volatile uint8_t state_ = capture::STATE_IDLE;
   uint32_t pendingStreamStartUs_ = 0;
   uint32_t emgSampleSeq_ = 0;

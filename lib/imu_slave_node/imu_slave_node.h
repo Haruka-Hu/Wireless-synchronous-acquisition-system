@@ -54,11 +54,9 @@ class ImuSlaveApp {
   static constexpr size_t BATCH_RING_CAPACITY = 256;
   static constexpr uint32_t SAMPLE_PERIOD_US = 1000;
   static constexpr uint32_t SEND_SUPERFRAME_US = 20000;
-  static constexpr uint8_t MAX_SENDS_PER_SLOT = 3;
-  static constexpr uint32_t RETRANSMIT_INTERVAL_US = 40000;
-  // ✅ 优化：设定基础重传 60ms (容忍 Master 的 40ms ACK)，加上 0~15ms 随机抖动避免碰撞
-  static constexpr uint32_t RETRANSMIT_BASE_US = 60000;   
-  static constexpr uint32_t RETRANSMIT_JITTER_US = 15000;
+  static constexpr uint8_t MAX_SENDS_PER_SLOT = 2;
+  static constexpr uint32_t RETRANSMIT_INTERVAL_US = 120000;
+  static constexpr uint32_t RETRANSMIT_JITTER_US = 30000;
   static constexpr size_t SYNC_WINDOW_CAPACITY = 128;
   static constexpr size_t SYNC_MIN_ROBUST_POINTS = 8;
   static constexpr uint8_t SYNC_OUTLIER_REJECT_PERCENT = 20;
@@ -96,6 +94,7 @@ class ImuSlaveApp {
   // 处理 Master Beacon。
   void handleBeacon(const uint8_t *mac, const uint8_t *data, int len);
   void handleCommandPacket(const uint8_t *data, int len);
+  void handleRadioConfigPacket(const uint8_t *data, int len);
   void handleSyncReply(const uint8_t *data, int len, uint32_t localRecvUs);
   // 处理 Master ACK。
   void handleAckPacket(const uint8_t *data, int len);
@@ -111,6 +110,8 @@ class ImuSlaveApp {
   void freezeSampleClockLocked();
   void sendSyncProbe();
   void sendSyncDiag();
+  bool applyRadioConfig(uint8_t channel, uint8_t rateCode);
+  void applyPendingRadioConfig();
   uint32_t localToMasterTimeUs(uint32_t localUs);
   uint32_t localToSampleTimeUs(uint32_t localUs);
   uint8_t currentState() const;
@@ -133,6 +134,7 @@ class ImuSlaveApp {
   // offsetMux_ 保护时间同步状态；ringMux_ 保护 batch ring 和样本序号。
   portMUX_TYPE offsetMux_ = portMUX_INITIALIZER_UNLOCKED;
   portMUX_TYPE ringMux_ = portMUX_INITIALIZER_UNLOCKED;
+  portMUX_TYPE radioMux_ = portMUX_INITIALIZER_UNLOCKED;
   volatile uint8_t state_ = capture::STATE_IDLE;
   uint16_t lastCommandSeq_ = 0;
   uint32_t pendingStreamStartUs_ = 0;
@@ -157,6 +159,13 @@ class ImuSlaveApp {
   uint32_t syncProbeReplies_ = 0;
   uint32_t syncProbeDrops_ = 0;
   uint32_t lastSyncProbeRttUs_ = 0;
+  uint8_t currentChannel_ = capture::ESPNOW_CHANNEL;
+  uint8_t currentRateCode_ = capture::ESPNOW_DEFAULT_RATE;
+  bool radioConfigPending_ = false;
+  uint16_t lastRadioConfigSeq_ = 0;
+  uint8_t pendingRadioChannel_ = capture::ESPNOW_CHANNEL;
+  uint8_t pendingRadioRateCode_ = capture::ESPNOW_DEFAULT_RATE;
+  uint32_t pendingRadioApplyMs_ = 0;
   uint8_t masterMac_[6] = {0};
   bool hasMasterMac_ = false;
   volatile bool lastSendOk_ = false;

@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QComboBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -625,22 +626,26 @@ class AcquisitionModel:
                     "vector_norm",
                 ]
             )
-            sync_path = csv_dir / f"sync_diag_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            self.sync_csv_fp = sync_path.open("w", newline="", encoding="utf-8")
-            self.sync_csv_writer = csv.writer(self.sync_csv_fp)
-            self.sync_csv_writer.writerow(
-                [
-                    "host_rx_time",
-                    "source",
-                    "source_id",
-                    "state",
-                    "beacon_seq",
-                    "offset_us",
-                    "drift_ppm",
-                    "residual_us",
-                    "beacon_count",
-                ]
-            )
+            if self.system_state != 3:
+                sync_path = csv_dir / f"sync_diag_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                self.sync_csv_fp = sync_path.open("w", newline="", encoding="utf-8")
+                self.sync_csv_writer = csv.writer(self.sync_csv_fp)
+                self.sync_csv_writer.writerow(
+                    [
+                        "host_rx_time",
+                        "source",
+                        "source_id",
+                        "state",
+                        "beacon_seq",
+                        "offset_us",
+                        "drift_ppm",
+                        "residual_us",
+                        "beacon_count",
+                    ]
+                )
+            else:
+                self.sync_csv_fp = None
+                self.sync_csv_writer = None
             self.is_recording = True
             return csv_path
 
@@ -897,9 +902,18 @@ class MainWindow(QMainWindow):
         self.stream_button = QPushButton("开始采集")
         self.stop_button = QPushButton("停止")
         self.record_button = QPushButton("开始录制 CSV")
+        self.channel_combo = QComboBox()
+        for channel in range(1, 14):
+            self.channel_combo.addItem(f"CH{channel}", channel)
+        self.channel_combo.setCurrentIndex(0)
+        self.rate_combo = QComboBox()
+        self.rate_combo.addItem("2Mbps", "2M")
+        self.rate_combo.addItem("1Mbps", "1M")
+        self.radio_button = QPushButton("应用无线")
         self.sync_button.clicked.connect(lambda: self.send_control_command("START_SYNC"))
         self.stream_button.clicked.connect(lambda: self.send_control_command("START_STREAM"))
         self.stop_button.clicked.connect(lambda: self.send_control_command("STOP"))
+        self.radio_button.clicked.connect(self.send_radio_command)
         self.record_button.setStyleSheet(
             "background-color: #2E7D32; color: white; font-weight: bold; padding: 8px 14px;"
         )
@@ -907,6 +921,9 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self.sync_button)
         top_row.addWidget(self.stream_button)
         top_row.addWidget(self.stop_button)
+        top_row.addWidget(self.channel_combo)
+        top_row.addWidget(self.rate_combo)
+        top_row.addWidget(self.radio_button)
         top_row.addWidget(self.record_button)
         status_column = QVBoxLayout()
         self.primary_status_label = QLabel(f"串口 {self.port} @ {self.baud}")
@@ -1084,6 +1101,19 @@ class MainWindow(QMainWindow):
             self.primary_status_label.setText(self.control_status_text)
         except Exception as exc:
             QMessageBox.warning(self, "命令发送失败", str(exc))
+
+    def send_radio_command(self) -> None:
+        """发送 RADIO channel/rate 到 Master；切换后需要重新同步再采集。"""
+        try:
+            channel = int(self.channel_combo.currentData())
+            rate = str(self.rate_combo.currentData())
+            command = f"RADIO {channel} {rate}"
+            self.reader.send_text_command(command)
+            self.control_status_text = f"已发送无线配置: CH{channel} / {rate}，请重新同步后采集"
+            self.control_status_until = time.time() + 5.0
+            self.primary_status_label.setText(self.control_status_text)
+        except Exception as exc:
+            QMessageBox.warning(self, "无线配置失败", str(exc))
 
     def _format_sync_line(self, name: str, values: list[SyncDiag], now: float) -> str:
         """格式化某个 Slave 的同步诊断和稳定性提示。"""

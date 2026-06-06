@@ -13,7 +13,7 @@ ImuSlaveApp g_app({
     {{10, 11, 13, 12, -1}, 0x18, 0x10},
     240,
     2000000,
-    32,
+    84,  // ESP-NOW TX power: 84 qdBm = 21 dBm max.
 });
 
 }  // namespace

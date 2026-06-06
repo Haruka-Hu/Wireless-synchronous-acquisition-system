@@ -9,6 +9,12 @@ namespace {
 MasterApp *g_activeApp = nullptr;
 constexpr uint32_t TASK_STACK_DEFAULT = 4096;
 constexpr uint32_t TASK_STACK_SERIAL_TX = 8192;
+constexpr uint16_t RADIO_CONFIG_APPLY_DELAY_MS = 250;
+constexpr uint8_t RADIO_CONFIG_REPEAT_COUNT = 10;
+
+wifi_phy_rate_t radioRateFromCode(uint8_t rateCode) {
+  return rateCode == capture::ESPNOW_RATE_1M ? WIFI_PHY_RATE_1M_L : WIFI_PHY_RATE_2M_L;
+}
 
 }  // namespace
 
@@ -122,7 +128,7 @@ bool MasterApp::initEspNow() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   WiFi.setSleep(false);
-  esp_wifi_set_channel(capture::ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(currentChannel_, WIFI_SECOND_CHAN_NONE);
 
   if (esp_now_init() != ESP_OK) {
     return false;
@@ -130,11 +136,11 @@ bool MasterApp::initEspNow() {
 
   // ✅ 新增：强制将 ESP-NOW 物理层空口速率从默认的 1Mbps 提升到 2Mbps
   // 大幅减少数据包在空气中的发送耗时，降低被干扰的概率
-  esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_2M_L);
+  esp_wifi_config_espnow_rate(WIFI_IF_STA, radioRateFromCode(currentRateCode_));
 
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, broadcastMac_, sizeof(broadcastMac_));
-  peerInfo.channel = capture::ESPNOW_CHANNEL;
+  peerInfo.channel = 0;
   peerInfo.encrypt = false;
   peerInfo.ifidx = WIFI_IF_STA;
   if (esp_now_add_peer(&peerInfo) != ESP_OK) {
@@ -156,7 +162,7 @@ bool MasterApp::ensureEspNowPeer(const uint8_t mac[6]) {
 
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, mac, 6);
-  peerInfo.channel = capture::ESPNOW_CHANNEL;
+  peerInfo.channel = 0;
   peerInfo.encrypt = false;
   peerInfo.ifidx = WIFI_IF_STA;
   return esp_now_add_peer(&peerInfo) == ESP_OK;
@@ -268,11 +274,7 @@ void MasterApp::markBatchReceived(SlaveRxState &state,
                                   uint8_t flags,
                                   bool &outDuplicate) {
   outDuplicate = false;
-  // 重传包本身不是错误；统计它是为了判断无线链路是否开始吃紧。
-  if ((flags & capture::IMU_FLAG_RETRANSMIT) != 0) {
-    ++state.retransmitPackets;
-    ++slaveRetransmitPackets_;
-  }
+  const bool isRetransmit = (flags & capture::IMU_FLAG_RETRANSMIT) != 0;
 
   if (!state.initialized) {
     // 第一个包作为接收窗口锚点，使后续 ACK 可以表达“这个包和它之后 32 个包”的状态。
@@ -286,7 +288,9 @@ void MasterApp::markBatchReceived(SlaveRxState &state,
   if (distance == 0 || distance > 32768U) {
     outDuplicate = true;
     ++state.duplicatePackets;
-    ++slaveDuplicatePackets_;
+    if (!isRetransmit) {
+      ++slaveDuplicatePackets_;
+    }
     return;
   }
 
@@ -305,11 +309,17 @@ void MasterApp::markBatchReceived(SlaveRxState &state,
   if ((state.recvBitmap & mask) != 0) {
     outDuplicate = true;
     ++state.duplicatePackets;
-    ++slaveDuplicatePackets_;
+    if (!isRetransmit) {
+      ++slaveDuplicatePackets_;
+    }
     return;
   }
 
   state.recvBitmap |= mask;
+  if (isRetransmit) {
+    ++state.retransmitPackets;
+    ++slaveRetransmitPackets_;
+  }
   advanceAckWindow(state);
 }
 
@@ -318,7 +328,7 @@ bool MasterApp::sendAck(SlaveRxState &state, uint32_t nowUs) {
   // ACK 单播回原 MAC；如果 peer 未登记，先补登记再发送。
   state.lastAckSentUs = nowUs;
   // ✅ 修复关键：无论底层 Wi-Fi 发送是否成功，先清除 pending 标志。
-  // 把重传的责任交还给 Slave 的 40ms 超时机制，防止 Master TX 队列死锁。
+  // 把重传的责任交还给 Slave 的超时机制，防止 Master TX 队列死锁。
   state.ackPending = false;
   if (!ensureEspNowPeer(state.mac)) {
     ++ackSendFails_;
@@ -335,7 +345,8 @@ bool MasterApp::sendAck(SlaveRxState &state, uint32_t nowUs) {
   return true;
 }
 
-// 把同一 Slave 短时间内产生的多个 ACK 合并成一次，避免 ESP-NOW 发送队列被 ACK 风暴打满。
+// 把同一 Slave 短时间内产生的多个 ACK 合并成一次；8ms 足够避开 ACK 风暴，
+// 同时能在 Slave 进入重传周期前确认 20ms 一个的新 batch。
 void MasterApp::sendPendingAcks(uint32_t nowUs) {
   for (size_t i = 0; i < MAX_TRACKED_SLAVES; ++i) {
     SlaveRxState &state = slaveRxStates_[i];
@@ -522,6 +533,29 @@ void MasterApp::broadcastCommand(uint8_t targetState, uint32_t effectiveMasterTi
   }
 }
 
+bool MasterApp::applyRadioConfig(uint8_t channel, uint8_t rateCode) {
+  if (!capture::isValidRadioChannel(channel) || !capture::isValidRadioRate(rateCode)) {
+    return false;
+  }
+  resetStreamingState();
+  state_ = capture::STATE_IDLE;
+  pendingStreamStartUs_ = 0;
+  currentChannel_ = channel;
+  currentRateCode_ = rateCode;
+  esp_wifi_set_channel(currentChannel_, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_config_espnow_rate(WIFI_IF_STA, radioRateFromCode(currentRateCode_));
+  return true;
+}
+
+void MasterApp::broadcastRadioConfig(uint8_t channel, uint8_t rateCode) {
+  uint8_t packet[capture::RADIO_CONFIG_WIRE_SIZE] = {};
+  capture::buildRadioConfigPacket(++radioConfigSeq_, channel, rateCode, RADIO_CONFIG_APPLY_DELAY_MS, packet);
+  for (uint8_t i = 0; i < RADIO_CONFIG_REPEAT_COUNT; ++i) {
+    esp_now_send(broadcastMac_, packet, sizeof(packet));
+    vTaskDelay(pdMS_TO_TICKS(12));
+  }
+}
+
 void MasterApp::transitionTo(uint8_t newState, uint32_t effectiveMasterTimeUs) {
   if (newState == capture::STATE_IDLE || newState == capture::STATE_SYNC || newState == capture::STATE_STREAM_PENDING) {
     resetStreamingState();
@@ -557,6 +591,10 @@ void MasterApp::handlePcCommand(String raw) {
     handlePcRetransmitCommand(raw);
     return;
   }
+  if (raw.startsWith("RADIO") || raw.startsWith("WIFI")) {
+    handlePcRadioCommand(raw);
+    return;
+  }
   if (raw == "START_SYNC") {
     transitionTo(capture::STATE_SYNC, 0);
     return;
@@ -569,6 +607,48 @@ void MasterApp::handlePcCommand(String raw) {
     transitionTo(capture::STATE_IDLE, 0);
     return;
   }
+}
+
+void MasterApp::handlePcRadioCommand(const String &raw) {
+  const int firstSpace = raw.indexOf(' ');
+  if (firstSpace < 0) {
+    return;
+  }
+  const int secondSpace = raw.indexOf(' ', firstSpace + 1);
+  if (secondSpace < 0) {
+    return;
+  }
+
+  String channelText = raw.substring(firstSpace + 1, secondSpace);
+  String rateText = raw.substring(secondSpace + 1);
+  channelText.trim();
+  rateText.trim();
+
+  const int channelValue = channelText.toInt();
+  uint8_t rateCode = 0;
+  if (rateText == "1" || rateText == "1M" || rateText == "1MBPS") {
+    rateCode = capture::ESPNOW_RATE_1M;
+  } else if (rateText == "2" || rateText == "2M" || rateText == "2MBPS") {
+    rateCode = capture::ESPNOW_RATE_2M;
+  }
+
+  if (!capture::isValidRadioChannel(static_cast<uint8_t>(channelValue)) || !capture::isValidRadioRate(rateCode)) {
+    return;
+  }
+
+  if (currentState() != capture::STATE_IDLE) {
+    transitionTo(capture::STATE_IDLE, 0);
+  }
+  broadcastRadioConfig(static_cast<uint8_t>(channelValue), rateCode);
+  vTaskDelay(pdMS_TO_TICKS(RADIO_CONFIG_APPLY_DELAY_MS + 80));
+  applyRadioConfig(static_cast<uint8_t>(channelValue), rateCode);
+
+  capture::StateAckPacket event{};
+  event.source = capture::SOURCE_EMG;
+  event.state = capture::STATE_IDLE;
+  event.commandSeq = commandSeq_;
+  event.effectiveMasterTimeUs = 0;
+  writePcStateEvent(event);
 }
 
 void MasterApp::handlePcRetransmitCommand(const String &raw) {
@@ -831,12 +911,10 @@ void MasterApp::sensorTask() {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
     const uint32_t timestampUs = micros();
-    int32_t ch6 = 0;
-    int32_t ch7 = 0;
-    int32_t ch8 = 0;
+    int32_t channels[8] = {0};
 
-    if (currentState() == capture::STATE_STREAM && ads_.readChannels(ch6, ch7, ch8)) {
-      writeSerialSample(capture::SOURCE_EMG, timestampUs, emgSampleSeq_++, 0, 0, ch6, ch7, ch8);
+    if (currentState() == capture::STATE_STREAM && ads_.readChannels(channels)) {
+      writeSerialSample(capture::SOURCE_EMG, timestampUs, emgSampleSeq_++, 0, 0, channels[5], channels[6], channels[7]);
     }
   }
 }
