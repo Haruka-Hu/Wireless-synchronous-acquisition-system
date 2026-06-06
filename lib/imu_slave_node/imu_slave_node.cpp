@@ -10,6 +10,10 @@ namespace {
 
 ImuSlaveApp *g_activeApp = nullptr;
 
+wifi_phy_rate_t radioRateFromCode(uint8_t rateCode) {
+  return rateCode == capture::ESPNOW_RATE_1M ? WIFI_PHY_RATE_1M_L : WIFI_PHY_RATE_2M_L;
+}
+
 }  // namespace
 
 // 保存节点配置，并用其中的 MPU6500 参数构造传感器驱动。
@@ -93,7 +97,7 @@ void ImuSlaveApp::onMpuDataReadyFromIsr() {
 
 // 根据下行包类型分发到 ACK、双向同步或 Beacon 时间同步处理。
 void ImuSlaveApp::onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
-  // Slave 接收四类下行包：COMMAND 切状态，ACK 释放缓存，SYNC_REPLY 校正时钟，Beacon 建立兜底模型。
+  // Slave 接收 COMMAND/无线配置/ACK/SYNC_REPLY/Beacon 等下行包。
   const uint32_t localRecvUs = micros();
   if (data == nullptr) {
     return;
@@ -107,6 +111,11 @@ void ImuSlaveApp::onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len)
 
   if (len == static_cast<int>(capture::COMMAND_WIRE_SIZE) && data[0] == capture::MSG_TYPE_COMMAND) {
     handleCommandPacket(data, len);
+    return;
+  }
+
+  if (len == static_cast<int>(capture::RADIO_CONFIG_WIRE_SIZE) && data[0] == capture::MSG_TYPE_RADIO_CONFIG) {
+    handleRadioConfigPacket(data, len);
     return;
   }
 
@@ -128,15 +137,14 @@ bool ImuSlaveApp::initEspNow() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   WiFi.setSleep(false);
-  esp_wifi_set_channel(capture::ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(currentChannel_, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_max_tx_power(config_.espnowTxPowerQdbm);
 
   if (esp_now_init() != ESP_OK) {
     return false;
   }
 
-  // ✅ 新增：和 Master 保持一致，提升物理速率
-  esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_2M_L);
+  esp_wifi_config_espnow_rate(WIFI_IF_STA, radioRateFromCode(currentRateCode_));
 
   esp_now_register_send_cb(onEspNowSentStatic);
   esp_now_register_recv_cb(onEspNowRecvStatic);
@@ -207,6 +215,68 @@ void ImuSlaveApp::handleCommandPacket(const uint8_t *data, int len) {
     return;
   }
   applyState(command.targetState, command.commandSeq, command.effectiveMasterTimeUs);
+}
+
+void ImuSlaveApp::handleRadioConfigPacket(const uint8_t *data, int len) {
+  capture::RadioConfigPacket config{};
+  if (!capture::decodeRadioConfigPacket(data, len, config)) {
+    return;
+  }
+
+  portENTER_CRITICAL(&radioMux_);
+  if (config.configSeq == lastRadioConfigSeq_ && radioConfigPending_) {
+    portEXIT_CRITICAL(&radioMux_);
+    return;
+  }
+  lastRadioConfigSeq_ = config.configSeq;
+  pendingRadioChannel_ = config.channel;
+  pendingRadioRateCode_ = config.rateCode;
+  pendingRadioApplyMs_ = millis() + config.applyDelayMs;
+  radioConfigPending_ = true;
+  portEXIT_CRITICAL(&radioMux_);
+}
+
+bool ImuSlaveApp::applyRadioConfig(uint8_t channel, uint8_t rateCode) {
+  if (!capture::isValidRadioChannel(channel) || !capture::isValidRadioRate(rateCode)) {
+    return false;
+  }
+
+  portENTER_CRITICAL(&offsetMux_);
+  state_ = capture::STATE_IDLE;
+  streamStarted_ = false;
+  pendingStreamStartUs_ = 0;
+  clockModelValid_ = false;
+  sampleClockModelValid_ = false;
+  portEXIT_CRITICAL(&offsetMux_);
+
+  portENTER_CRITICAL(&ringMux_);
+  resetRingLocked();
+  portEXIT_CRITICAL(&ringMux_);
+
+  currentChannel_ = channel;
+  currentRateCode_ = rateCode;
+  esp_wifi_set_channel(currentChannel_, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_config_espnow_rate(WIFI_IF_STA, radioRateFromCode(currentRateCode_));
+  return true;
+}
+
+void ImuSlaveApp::applyPendingRadioConfig() {
+  uint8_t channel = 0;
+  uint8_t rateCode = 0;
+  bool shouldApply = false;
+
+  portENTER_CRITICAL(&radioMux_);
+  if (radioConfigPending_ && static_cast<int32_t>(millis() - pendingRadioApplyMs_) >= 0) {
+    channel = pendingRadioChannel_;
+    rateCode = pendingRadioRateCode_;
+    radioConfigPending_ = false;
+    shouldApply = true;
+  }
+  portEXIT_CRITICAL(&radioMux_);
+
+  if (shouldApply) {
+    applyRadioConfig(channel, rateCode);
+  }
 }
 
 void ImuSlaveApp::handleSyncReply(const uint8_t *data, int len, uint32_t localRecvUs) {
@@ -319,7 +389,7 @@ void ImuSlaveApp::sendStateAck(uint16_t commandSeq, uint32_t effectiveMasterTime
   if (!esp_now_is_peer_exist(masterMac)) {
     esp_now_peer_info_t peerInfo = {};
     memcpy(peerInfo.peer_addr, masterMac, 6);
-    peerInfo.channel = capture::ESPNOW_CHANNEL;
+    peerInfo.channel = 0;
     peerInfo.encrypt = false;
     peerInfo.ifidx = WIFI_IF_STA;
     esp_now_add_peer(&peerInfo);
@@ -524,7 +594,7 @@ void ImuSlaveApp::sendSyncProbe() {
   if (!esp_now_is_peer_exist(masterMac)) {
     esp_now_peer_info_t peerInfo = {};
     memcpy(peerInfo.peer_addr, masterMac, 6);
-    peerInfo.channel = capture::ESPNOW_CHANNEL;
+    peerInfo.channel = 0;
     peerInfo.encrypt = false;
     peerInfo.ifidx = WIFI_IF_STA;
     if (esp_now_add_peer(&peerInfo) != ESP_OK) {
@@ -682,10 +752,7 @@ bool ImuSlaveApp::takeSendCandidate(capture::ImuBatchWirePacket &outPacket, uint
       capture::writeImuBatchCrc(outPacket);
     }
 
-    // ✅ 核心优化 3：带有退避抖动的重传定时器
-    // 计算下一次允许发送的绝对时间：当前时间 + 60ms + (0~15ms 随机抖动)
-    // 随机抖动彻底打破了多节点在干扰后同时试图重传的“碰撞死锁”
-    slot.nextSendUs = nowUs + RETRANSMIT_BASE_US + random(RETRANSMIT_JITTER_US);
+    slot.nextSendUs = nowUs + RETRANSMIT_INTERVAL_US + random(RETRANSMIT_JITTER_US);
 
     ++slot.sendAttempts;
     ++sendAttempts_;
@@ -725,6 +792,8 @@ void ImuSlaveApp::wirelessTask() {
   uint32_t lastSlotIndex = UINT32_MAX;
 
   for (;;) {
+    applyPendingRadioConfig();
+
     if (!loadMasterMac(masterMac)) {
       vTaskDelay(pdMS_TO_TICKS(2));
       continue;
@@ -733,7 +802,7 @@ void ImuSlaveApp::wirelessTask() {
     if (!esp_now_is_peer_exist(masterMac)) {
       esp_now_peer_info_t peerInfo = {};
       memcpy(peerInfo.peer_addr, masterMac, 6);
-      peerInfo.channel = capture::ESPNOW_CHANNEL;
+      peerInfo.channel = 0;
       peerInfo.encrypt = false;
       peerInfo.ifidx = WIFI_IF_STA;
       if (esp_now_add_peer(&peerInfo) != ESP_OK) {
@@ -786,7 +855,7 @@ void ImuSlaveApp::wirelessTask() {
     lastSlotIndex = slotIndex;
 
     for (uint8_t sendCount = 0; sendCount < MAX_SENDS_PER_SLOT; ++sendCount) {
-      // 每个 slot 最多追发 3 个 batch，用恢复后的空口时间追回短时积压。
+      // 每个 slot 最多追发 2 个 batch，避免重发挤占下一批新数据的 ACK 时间。
       if (!takeSendCandidate(packet, micros())) {
         break;
       }

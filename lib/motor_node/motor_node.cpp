@@ -50,6 +50,11 @@ void MotorApp::begin() {
   Serial.println();
   Serial.println("Neuro Hammer motor node starting...");
 
+  // 初始化时将硬编码的默认参数加载到动态字典中
+  for (uint8_t i = 0; i < config_.strikeProfileCount; ++i) {
+    strikeProfiles_[i + 1] = config_.strikeProfiles[i];
+  }
+
   // BLE 写入先进入命令队列，loopOnce 再处理，保证 UI 连续写命令时不会卡住 BLE 回调。
   commandQueue_ = xQueueCreate(12, sizeof(MotorCommand));
   motor_.begin();
@@ -84,25 +89,45 @@ MotorApp::MotorCommand MotorApp::parseCommand(String raw) {
   raw.toUpperCase();
 
   if (raw == "PING") {
-    return {CommandType::Ping, 0};
+    return {CommandType::Ping, 0, {}};
   }
   if (raw == "STOP") {
-    return {CommandType::Stop, 0};
+    return {CommandType::Stop, 0, {}};
   }
   if (raw == "MOTOR_FWD") {
-    return {CommandType::ManualForward, 0};
+    return {CommandType::ManualForward, 0, {}};
   }
   if (raw == "MOTOR_REV") {
-    return {CommandType::ManualReverse, 0};
+    return {CommandType::ManualReverse, 0, {}};
   }
-  if (raw.startsWith("STRIKE_") && raw.length() == 8) {
+  
+  if (raw.startsWith("STRIKE_")) {
     const int gear = raw.substring(7).toInt();
-    if (gear >= 1 && gear <= 5) {
-      return {CommandType::Strike, static_cast<uint8_t>(gear)};
+    if (gear > 0) {
+      return {CommandType::Strike, static_cast<uint8_t>(gear), {}};
     }
   }
 
-  return {CommandType::Unknown, 0};
+  // 在 parseCommand 函数中找到 "SET_STRIKE " 的判断分支，替换为以下代码：
+  if (raw.startsWith("SET_STRIKE ")) {
+    int gear, touchPwm, pullPwm, strikePwm;
+    uint32_t touchMs, pullMs, strikeMs;
+    // 解析 7 个参数：档位, 触碰PWM, 触碰时间, 回撤PWM, 回撤时间, 敲击PWM, 敲击时间
+    if (sscanf(raw.c_str(), "SET_STRIKE %d %d %u %d %u %d %u", 
+               &gear, &touchPwm, &touchMs, &pullPwm, &pullMs, &strikePwm, &strikeMs) == 7) {
+      return {CommandType::SetStrike, static_cast<uint8_t>(gear), 
+              {touchPwm, touchMs, pullPwm, pullMs, strikePwm, strikeMs}};
+    }
+  }
+
+  if (raw.startsWith("DEL_STRIKE ")) {
+    int gear;
+    if (sscanf(raw.c_str(), "DEL_STRIKE %d", &gear) == 1) {
+      return {CommandType::DelStrike, static_cast<uint8_t>(gear), {}};
+    }
+  }
+
+  return {CommandType::Unknown, 0, {}};
 }
 
 // 创建 Nordic UART 风格 BLE 服务，并开始广播设备名。
@@ -166,15 +191,16 @@ void MotorApp::stopMotor() {
   activeGear_ = 0;
   phaseDeadlineMs_ = 0;
 }
-
-// 启动指定档位的一次完整叩击，先进入回撤阶段。
+// 启动指定档位的一次完整叩击，先进入触碰阶段。
 void MotorApp::beginStrike(uint8_t gear) {
-  // 五档叩击共享同一套两阶段时序，只从查表参数改变 PWM 和持续时间。
-  const StrikeProfile &profile = config_.strikeProfiles[gear - 1];
-  mode_ = MotorMode::StrikePull;
+  auto it = strikeProfiles_.find(gear);
+  if (it == strikeProfiles_.end()) return;
+  const StrikeProfile &profile = it->second;
+
+  mode_ = MotorMode::StrikeTouch; // 修改起点为触碰状态
   activeGear_ = gear;
-  phaseDeadlineMs_ = millis() + profile.pullMs;
-  motor_.driveReverse(profile.pullPwm);
+  phaseDeadlineMs_ = millis() + profile.touchMs;
+  motor_.driveForward(profile.touchPwm); // 正向小力度转动
   notifyHost("ACK: STRIKE_" + String(gear));
 }
 
@@ -207,10 +233,21 @@ void MotorApp::handleCommand(const MotorCommand &command) {
       notifyHost("ACK: STOP");
       break;
     case CommandType::Strike:
-      if (command.gear < 1 || command.gear > config_.strikeProfileCount) {
+      if (strikeProfiles_.find(command.gear) == strikeProfiles_.end()) {
         notifyHost("ERR: INVALID_GEAR");
       } else {
         beginStrike(command.gear);
+      }
+      break;
+    case CommandType::SetStrike:
+      strikeProfiles_[command.gear] = command.profile;
+      notifyHost("ACK: SET_STRIKE_" + String(command.gear));
+      break;
+    case CommandType::DelStrike:
+      if (strikeProfiles_.erase(command.gear)) {
+        notifyHost("ACK: DEL_STRIKE_" + String(command.gear));
+      } else {
+        notifyHost("ERR: GEAR_NOT_FOUND");
       }
       break;
     case CommandType::ManualForward:
@@ -228,8 +265,10 @@ void MotorApp::handleCommand(const MotorCommand &command) {
 
 // 根据 millis() 推进叩击状态机；手动模式不在这里自动退出。
 void MotorApp::updateMotorState() {
-  // 手动正反转不靠定时退出，只能由 STOP 或断开连接停止。
-  if (mode_ != MotorMode::StrikePull && mode_ != MotorMode::StrikeFire) {
+  // 增加 StrikeTouch 的有效性判断
+  if (mode_ != MotorMode::StrikeTouch && 
+      mode_ != MotorMode::StrikePull && 
+      mode_ != MotorMode::StrikeFire) {
     return;
   }
 
@@ -237,9 +276,23 @@ void MotorApp::updateMotorState() {
     return;
   }
 
-  const StrikeProfile &profile = config_.strikeProfiles[activeGear_ - 1];
+  auto it = strikeProfiles_.find(activeGear_);
+  if (it == strikeProfiles_.end()) {
+    stopMotor(); 
+    return;
+  }
+  const StrikeProfile &profile = it->second;
+
+  // 新增：触碰时间到后，切到反向回撤
+  if (mode_ == MotorMode::StrikeTouch) {
+    mode_ = MotorMode::StrikePull;
+    phaseDeadlineMs_ = millis() + profile.pullMs;
+    motor_.driveReverse(profile.pullPwm);
+    return;
+  }
+
+  // 原有逻辑：回撤时间到后切到正向敲击。
   if (mode_ == MotorMode::StrikePull) {
-    // 回撤时间到后切到正向敲击。
     mode_ = MotorMode::StrikeFire;
     phaseDeadlineMs_ = millis() + profile.strikeMs;
     motor_.driveForward(profile.strikePwm);

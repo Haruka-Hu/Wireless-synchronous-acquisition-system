@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <stdint.h>
+#include <map>  // 引入 map 容器用于动态管理档位
 
 #include "bts7960_motor.h"
 
@@ -11,8 +12,10 @@
 // - MotorApp 在中间解析命令，并用非阻塞状态机完成叩击/手动转动。
 class MotorApp {
  public:
-  // 单次叩击分两段：先反向回撤，再正向敲击。
+  // 单次叩击分三段：先正向小力触碰，再反向回撤，最后正向敲击。
   struct StrikeProfile {
+    int touchPwm;       // 新增：触碰肌腱时的 PWM（力度）
+    uint32_t touchMs;   // 新增：触碰肌腱的持续时间
     int pullPwm;
     uint32_t pullMs;
     int strikePwm;
@@ -59,6 +62,8 @@ class MotorApp {
     Strike,
     ManualForward,
     ManualReverse,
+    SetStrike,  // 设置/更新档位参数
+    DelStrike,  // 删除档位
     Unknown,
   };
 
@@ -66,11 +71,13 @@ class MotorApp {
   struct MotorCommand {
     CommandType type;
     uint8_t gear;
+    StrikeProfile profile; // 用于在队列中传递新的参数设定
   };
 
-  // 叩击状态机的运行阶段。时间到后自动从回撤切换到敲击，再停止。
+  // 叩击状态机的运行阶段。
   enum class MotorMode : uint8_t {
     Idle,
+    StrikeTouch,    // 新增：触碰阶段
     StrikePull,
     StrikeFire,
     ManualForward,
@@ -109,4 +116,7 @@ class MotorApp {
   uint8_t activeGear_ = 0;
   // 当前阶段的结束时间，使用 millis() 时间域。
   uint32_t phaseDeadlineMs_ = 0;
+
+  // 动态存储档位参数字典 (Key: 档位号, Value: 动作参数)
+  std::map<uint8_t, StrikeProfile> strikeProfiles_;
 };

@@ -261,6 +261,45 @@ bool decodeCommandPacket(const uint8_t *data, int len, CommandPacket &outCommand
   return outCommand.targetState <= STATE_STREAM;
 }
 
+bool isValidRadioChannel(uint8_t channel) {
+  return channel >= 1 && channel <= 13;
+}
+
+bool isValidRadioRate(uint8_t rateCode) {
+  return rateCode == ESPNOW_RATE_1M || rateCode == ESPNOW_RATE_2M;
+}
+
+void buildRadioConfigPacket(uint16_t configSeq,
+                            uint8_t channel,
+                            uint8_t rateCode,
+                            uint16_t applyDelayMs,
+                            uint8_t outBytes[RADIO_CONFIG_WIRE_SIZE]) {
+  memset(outBytes, 0, RADIO_CONFIG_WIRE_SIZE);
+  outBytes[0] = MSG_TYPE_RADIO_CONFIG;
+  encodeU16LE(&outBytes[1], configSeq);
+  outBytes[3] = channel;
+  outBytes[4] = rateCode;
+  encodeU16LE(&outBytes[5], applyDelayMs);
+  const uint16_t crc = crc16Ccitt(outBytes, RADIO_CONFIG_WIRE_SIZE - 2);
+  encodeU16LE(&outBytes[RADIO_CONFIG_WIRE_SIZE - 2], crc);
+}
+
+bool decodeRadioConfigPacket(const uint8_t *data, int len, RadioConfigPacket &outConfig) {
+  if (data == nullptr || len != static_cast<int>(RADIO_CONFIG_WIRE_SIZE) || data[0] != MSG_TYPE_RADIO_CONFIG) {
+    return false;
+  }
+  const uint16_t receivedCrc = decodeU16LE(&data[RADIO_CONFIG_WIRE_SIZE - 2]);
+  const uint16_t calculatedCrc = crc16Ccitt(data, RADIO_CONFIG_WIRE_SIZE - 2);
+  if (receivedCrc != calculatedCrc) {
+    return false;
+  }
+  outConfig.configSeq = decodeU16LE(&data[1]);
+  outConfig.channel = data[3];
+  outConfig.rateCode = data[4];
+  outConfig.applyDelayMs = decodeU16LE(&data[5]);
+  return isValidRadioChannel(outConfig.channel) && isValidRadioRate(outConfig.rateCode);
+}
+
 void buildStateAckPacket(uint8_t source,
                          uint8_t state,
                          uint16_t commandSeq,

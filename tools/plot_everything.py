@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import queue
+import subprocess
 import struct
 import sys
 import threading
@@ -41,6 +43,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QComboBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -694,22 +697,26 @@ class AcquisitionModel:
                     "vector_norm",
                 ]
             )
-            sync_path = csv_dir / f"sync_diag_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            self.sync_csv_fp = sync_path.open("w", newline="", encoding="utf-8")
-            self.sync_csv_writer = csv.writer(self.sync_csv_fp)
-            self.sync_csv_writer.writerow(
-                [
-                    "host_rx_time",
-                    "source",
-                    "source_id",
-                    "state",
-                    "beacon_seq",
-                    "offset_us",
-                    "drift_ppm",
-                    "residual_us",
-                    "beacon_count",
-                ]
-            )
+            if self.system_state != 3:
+                sync_path = csv_dir / f"sync_diag_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                self.sync_csv_fp = sync_path.open("w", newline="", encoding="utf-8")
+                self.sync_csv_writer = csv.writer(self.sync_csv_fp)
+                self.sync_csv_writer.writerow(
+                    [
+                        "host_rx_time",
+                        "source",
+                        "source_id",
+                        "state",
+                        "beacon_seq",
+                        "offset_us",
+                        "drift_ppm",
+                        "residual_us",
+                        "beacon_count",
+                    ]
+                )
+            else:
+                self.sync_csv_fp = None
+                self.sync_csv_writer = None
             self.is_recording = True
             return csv_path
 
@@ -1016,7 +1023,9 @@ class MainWindow(QMainWindow):
         self.curves: dict[int, tuple] = {}
         self.emg_plots: list[pg.PlotItem] = []
         self.control_status_text = ""
+        self.control_status_color = "#FFD740"
         self.control_status_until = 0.0
+        self.current_recording_path: Path | None = None
 
         self.setWindowTitle("Wireless Capture Scope - EMG Bandpass Mode")
         self.setMinimumWidth(1200) # 设定最小宽度保障排版
@@ -1029,32 +1038,63 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(10)
 
         # --- 顶部控制与状态栏结构化重构 ---
-        top_row = QHBoxLayout()
+        top_row = QVBoxLayout()
 
         # 1. 控制面板 Group
         control_group = QGroupBox("系统控制")
-        control_layout = QHBoxLayout(control_group)
+        control_layout = QVBoxLayout(control_group)
+        action_layout = QHBoxLayout()
+        radio_layout = QHBoxLayout()
         self.sync_button = QPushButton("开始同步")
         self.stream_button = QPushButton("开始采集")
         self.stop_button = QPushButton("停止")
         self.record_button = QPushButton("开始录制 CSV")
+        self.channel_combo = QComboBox()
+        for channel in range(1, 14):
+            self.channel_combo.addItem(f"CH{channel}", channel)
+        self.channel_combo.setCurrentIndex(0)
+        self.rate_combo = QComboBox()
+        self.rate_combo.addItem("2Mbps", "2M")
+        self.rate_combo.addItem("1Mbps", "1M")
+        self.radio_button = QPushButton("应用无线")
+
+        for button in (self.sync_button, self.stream_button, self.stop_button, self.radio_button):
+            button.setMinimumWidth(96)
+            button.setMinimumHeight(34)
+        self.record_button.setMinimumWidth(132)
+        self.record_button.setMinimumHeight(34)
+        self.channel_combo.setMinimumWidth(92)
+        self.rate_combo.setMinimumWidth(92)
         
         button_style = "padding: 6px 12px; font-weight: bold; border-radius: 4px;"
         self.sync_button.setStyleSheet(button_style + "background-color: #3949AB; color: white;")
         self.stream_button.setStyleSheet(button_style + "background-color: #00897B; color: white;")
         self.stop_button.setStyleSheet(button_style + "background-color: #E53935; color: white;")
         self.record_button.setStyleSheet(button_style + "background-color: #2E7D32; color: white;")
+        self.radio_button.setStyleSheet(button_style)
 
         self.sync_button.clicked.connect(lambda: self.send_control_command("START_SYNC"))
         self.stream_button.clicked.connect(lambda: self.send_control_command("START_STREAM"))
         self.stop_button.clicked.connect(lambda: self.send_control_command("STOP"))
+        self.radio_button.clicked.connect(self.send_radio_command)
         self.record_button.clicked.connect(self.toggle_recording)
         
-        control_layout.addWidget(self.sync_button)
-        control_layout.addWidget(self.stream_button)
-        control_layout.addWidget(self.stop_button)
-        control_layout.addWidget(self.record_button)
-        top_row.addWidget(control_group, stretch=1) # 设置合理的空间权重
+        action_layout.addWidget(self.sync_button)
+        action_layout.addWidget(self.stream_button)
+        action_layout.addWidget(self.stop_button)
+        action_layout.addWidget(self.record_button)
+        action_layout.addStretch()
+        radio_layout.addWidget(QLabel("无线信道"))
+        radio_layout.addWidget(self.channel_combo)
+        radio_layout.addWidget(QLabel("速率"))
+        radio_layout.addWidget(self.rate_combo)
+        radio_layout.addWidget(self.radio_button)
+        radio_layout.addStretch()
+        control_layout.addLayout(action_layout)
+        control_layout.addLayout(radio_layout)
+        top_row.addWidget(control_group)
+
+        info_row = QHBoxLayout()
 
         # 2. 核心状态 Group
         status_group = QGroupBox("实时状态")
@@ -1071,7 +1111,7 @@ class MainWindow(QMainWindow):
         
         status_layout.addWidget(self.primary_status_label)
         status_layout.addWidget(self.sync_status_label)
-        top_row.addWidget(status_group, stretch=2)
+        info_row.addWidget(status_group, stretch=1)
 
         # 3. 链路诊断 Group
         diag_group = QGroupBox("无线与底层诊断")
@@ -1085,7 +1125,8 @@ class MainWindow(QMainWindow):
         self.link_status_label.setStyleSheet("font-size: 12px; color: #BBBBBB; line-height: 1.4;") 
         
         diag_layout.addWidget(self.link_status_label)
-        top_row.addWidget(diag_group, stretch=2)
+        info_row.addWidget(diag_group, stretch=2)
+        top_row.addLayout(info_row)
 
         main_layout.addLayout(top_row)
         # --- 顶部重构结束 ---
@@ -1263,9 +1304,24 @@ class MainWindow(QMainWindow):
                 self.control_status_text = f"已发送命令: {command} <br><span style='color:#FFAB40;'>{warning_text}</span>"
             else:
                 self.control_status_text = f"已发送命令: {command}"
+            self.control_status_color = "#FFD740"
             self.control_status_until = time.time() + 3.0
         except Exception as exc:
             QMessageBox.warning(self, "命令发送失败", str(exc))
+
+    def send_radio_command(self) -> None:
+        """发送 RADIO channel/rate 到 Master；切换后需要重新同步再采集。"""
+        try:
+            channel = int(self.channel_combo.currentData())
+            rate = str(self.rate_combo.currentData())
+            command = f"RADIO {channel} {rate}"
+            self.reader.send_text_command(command)
+            self.reader.send_text_command("PING")
+            self.control_status_text = f"已发送无线配置: CH{channel} / {rate}，请重新同步后采集"
+            self.control_status_color = "#FFD740"
+            self.control_status_until = time.time() + 5.0
+        except Exception as exc:
+            QMessageBox.warning(self, "无线配置失败", str(exc))
 
     def _format_sync_line(self, name: str, values: list[SyncDiag], now: float) -> str:
         """格式化某个 Slave 的同步诊断和稳定性提示。"""
@@ -1372,7 +1428,11 @@ class MainWindow(QMainWindow):
             now,
         )
         
-        control_status = f"<br><span style='color:#FFD740;'>{self.control_status_text}</span>" if now < self.control_status_until else ""
+        control_status = (
+            f"<br><span style='color:{self.control_status_color};'>{self.control_status_text}</span>"
+            if now < self.control_status_until
+            else ""
+        )
         
         # 1. 核心状态显示重构 (折行排版)
         self.primary_status_label.setText(
@@ -1402,7 +1462,7 @@ class MainWindow(QMainWindow):
         self.link_status_label.setText(
             f"<b>[连接状态]</b> {slave1_text} &nbsp;&nbsp; {slave2_text}<br>"
             f"<b>[缓冲队列]</b> Gyro: {gyro_count} &nbsp;&nbsp; Accel: {accel_count}<br>"
-            f"<b>[无线吞吐]</b> Master收到: {diag_forwarded}/s &nbsp;&nbsp; 错包(err): {diag_errors_total} &nbsp;&nbsp; 事件重发: {diag_link_events_total}<br>"
+            f"<b>[无线吞吐]</b> Master收到: {diag_forwarded}/s &nbsp;&nbsp; 错包(err): {diag_errors_total} &nbsp;&nbsp; 无线补包: {diag_link_events_total}<br>"
             f"<b>[链路丢包]</b> Slave抛弃(qdrop): {diag_queue_drops_total} &nbsp;&nbsp; 确认失败(ackfail): {diag_ack_fails_total}<br>"
             f"<b>[底层串流]</b> CRC错: {parser_stats.crc_fails} &nbsp;&nbsp; 帧头错: {parser_stats.bad_headers} "
             f"&nbsp;&nbsp; count错: {parser_stats.bad_counts}({parser_stats.last_bad_count}) &nbsp;&nbsp; PC跳帧: {parser_stats.pc_sequence_gaps}<br>"
@@ -1419,16 +1479,59 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 QMessageBox.critical(self, "录制失败", str(exc))
                 return
+            self.current_recording_path = csv_path
             self.record_button.setText("停止录制 CSV")
             self.record_button.setStyleSheet(
                 "padding: 6px 12px; font-weight: bold; border-radius: 4px; background-color: #C62828; color: white;"
             )
         else:
+            csv_path = self.current_recording_path
             self.model.stop_recording()
+            self.current_recording_path = None
             self.record_button.setText("开始录制 CSV")
             self.record_button.setStyleSheet(
                 "padding: 6px 12px; font-weight: bold; border-radius: 4px; background-color: #2E7D32; color: white;"
             )
+            if csv_path is not None:
+                self.control_status_text = f"录制已停止，正在分析: {html.escape(csv_path.name)}"
+                self.control_status_color = "#000000"
+                self.control_status_until = time.time() + 60.0
+                threading.Thread(target=self._analyze_recording_csv, args=(csv_path,), daemon=True).start()
+
+    def _analyze_recording_csv(self, csv_path: Path) -> None:
+        """后台运行 analyze_data.py，并把丢包摘要显示到状态栏。"""
+        try:
+            project_root = Path(__file__).resolve().parent.parent
+            result = subprocess.run(
+                [sys.executable, str(project_root / "tools" / "analyze_data.py"), str(csv_path)],
+                cwd=project_root,
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            if result.returncode != 0:
+                detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+                self.control_status_text = f"录制分析失败: {html.escape(detail[-240:])}"
+                self.control_status_color = "#000000"
+                self.control_status_until = time.time() + 60.0
+                return
+
+            summary_lines = []
+            for line in result.stdout.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("===") or stripped.startswith("总接收包数") or stripped.startswith("丢包率"):
+                    summary_lines.append(stripped)
+            if not summary_lines:
+                summary_lines = ["分析完成，但没有解析到丢包摘要。"]
+            escaped_summary = "<br>".join(html.escape(line) for line in summary_lines[:12])
+            self.control_status_text = f"录制分析完成: {html.escape(csv_path.name)}<br>{escaped_summary}"
+            self.control_status_color = "#000000"
+            self.control_status_until = time.time() + 120.0
+        except Exception as exc:
+            self.control_status_text = f"录制分析异常: {html.escape(type(exc).__name__)}: {html.escape(str(exc))}"
+            self.control_status_color = "#000000"
+            self.control_status_until = time.time() + 60.0
 
 
 def main() -> int:

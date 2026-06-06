@@ -29,9 +29,13 @@ constexpr uint8_t MSG_TYPE_COMMAND = 0x12;
 constexpr uint8_t MSG_TYPE_STATE_ACK = 0x13;
 constexpr uint8_t MSG_TYPE_SYNC_PROBE = 0x14;
 constexpr uint8_t MSG_TYPE_SYNC_REPLY = 0x15;
+constexpr uint8_t MSG_TYPE_RADIO_CONFIG = 0x16;
 constexpr uint8_t MSG_TYPE_IMU_BATCH = 0x20;
 constexpr uint8_t MSG_TYPE_SYNC_DIAG = 0x21;
 constexpr uint8_t ESPNOW_CHANNEL = 1;
+constexpr uint8_t ESPNOW_RATE_1M = 1;
+constexpr uint8_t ESPNOW_RATE_2M = 2;
+constexpr uint8_t ESPNOW_DEFAULT_RATE = ESPNOW_RATE_2M;
 
 enum SystemState : uint8_t {
   STATE_IDLE = 0,
@@ -47,6 +51,7 @@ constexpr size_t IMU_BATCH_HEADER_SIZE = 14;
 constexpr size_t IMU_BATCH_WIRE_SIZE = IMU_BATCH_HEADER_SIZE + IMU_BATCH_SIZE * IMU_SAMPLE_WIRE_SIZE + 2;
 constexpr size_t IMU_ACK_WIRE_SIZE = 18;
 constexpr size_t COMMAND_WIRE_SIZE = 10;
+constexpr size_t RADIO_CONFIG_WIRE_SIZE = 9;
 constexpr size_t STATE_ACK_WIRE_SIZE = 11;
 constexpr size_t SYNC_PROBE_WIRE_SIZE = 10;
 constexpr size_t SYNC_REPLY_WIRE_SIZE = 18;
@@ -79,6 +84,13 @@ struct CommandPacket {
   uint16_t commandSeq;
   uint8_t targetState;
   uint32_t effectiveMasterTimeUs;
+};
+
+struct RadioConfigPacket {
+  uint16_t configSeq;
+  uint8_t channel;
+  uint8_t rateCode;
+  uint16_t applyDelayMs;
 };
 
 // Slave 收到状态命令后回 ACK，Master 再转成 PC 状态事件。
@@ -219,6 +231,15 @@ void buildCommandPacket(uint16_t commandSeq,
                         uint32_t effectiveMasterTimeUs,
                         uint8_t outBytes[COMMAND_WIRE_SIZE]);
 bool decodeCommandPacket(const uint8_t *data, int len, CommandPacket &outCommand);
+
+bool isValidRadioChannel(uint8_t channel);
+bool isValidRadioRate(uint8_t rateCode);
+void buildRadioConfigPacket(uint16_t configSeq,
+                            uint8_t channel,
+                            uint8_t rateCode,
+                            uint16_t applyDelayMs,
+                            uint8_t outBytes[RADIO_CONFIG_WIRE_SIZE]);
+bool decodeRadioConfigPacket(const uint8_t *data, int len, RadioConfigPacket &outConfig);
 
 void buildStateAckPacket(uint8_t source,
                          uint8_t state,
